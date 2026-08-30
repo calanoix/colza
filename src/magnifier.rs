@@ -69,22 +69,26 @@ pub fn run(screenshot: RgbImage) -> anyhow::Result<Option<Rgb>> {
     Ok(rx.try_recv().ok())
 }
 
-struct MagnifierApp {
-    screenshot: RgbImage,
-    cursor_pos: egui::Pos2,
-    result_tx: std::sync::mpsc::Sender<Rgb>,
+/// Everything the magnifier needs to sample colors from the captured
+/// screenshot and map window-space points to image pixels. This is the
+/// reusable core: both the standalone `MagnifierApp` (CLI `magnify`
+/// subcommand, own eframe event loop) and an embedding app (e.g. a
+/// "pick" mode inside a bigger eframe window) can hold one of these and
+/// call `draw` / `handle_input` directly from their own `update()`.
+pub struct MagnifierState {
+    pub screenshot: RgbImage,
+    pub cursor_pos: egui::Pos2,
 }
 
-impl MagnifierApp {
-    fn new(screenshot: RgbImage, result_tx: std::sync::mpsc::Sender<Rgb>) -> Self {
+impl MagnifierState {
+    pub fn new(screenshot: RgbImage) -> Self {
         Self {
             screenshot,
             cursor_pos: egui::Pos2::ZERO,
-            result_tx,
         }
     }
 
-    fn color_at(&self, image_pos: (u32, u32)) -> Rgb {
+    pub fn color_at(&self, image_pos: (u32, u32)) -> Rgb {
         let x = image_pos.0.min(self.screenshot.width().saturating_sub(1));
         let y = image_pos.1.min(self.screenshot.height().saturating_sub(1));
         let px = self.screenshot.get_pixel(x, y);
@@ -95,7 +99,7 @@ impl MagnifierApp {
     /// screenshot, accounting for the screenshot possibly being a
     /// different resolution than the logical window size (HiDPI), the
     /// same role `self.dpr` plays in `picker.py`.
-    fn image_pos_for(&self, ctx: &egui::Context, logical: egui::Pos2) -> (u32, u32) {
+    pub fn image_pos_for(&self, ctx: &egui::Context, logical: egui::Pos2) -> (u32, u32) {
         let screen_rect = ctx.screen_rect();
         let scale_x = self.screenshot.width() as f32 / screen_rect.width().max(1.0);
         let scale_y = self.screenshot.height() as f32 / screen_rect.height().max(1.0);
@@ -105,8 +109,66 @@ impl MagnifierApp {
         )
     }
 
+    /// Reads pointer/keyboard input for this frame: updates `cursor_pos`
+    /// (including arrow-key nudging, like `PickerOverlay.keyPressEvent`),
+    /// and reports whether the user picked (click/Enter) or cancelled
+    /// (Esc) this frame. Does not draw anything and does not close any
+    /// window — the caller decides what "picked"/"cancelled" means.
+    pub fn handle_input(&mut self, ctx: &egui::Context) -> MagnifierInput {
+        let mut clicked_or_entered = false;
+        let mut cancelled = false;
+
+        // IMPORTANT: `ctx.input(...)` holds an internal lock on egui's
+        // input state for the duration of the closure. Calling anything
+        // that itself needs to lock `ctx` (like `ctx.screen_rect()`, which
+        // `image_pos_for` calls) from *inside* this closure re-enters that
+        // lock and deadlocks — this was the freeze-on-click bug. So this
+        // closure only reads `input` and sets plain local flags; anything
+        // that needs `ctx` again happens after the closure returns.
+        ctx.input(|input| {
+            if let Some(pos) = input.pointer.latest_pos() {
+                self.cursor_pos = pos;
+            }
+
+            // Arrow keys nudge the cursor by one logical pixel, mirroring
+            // `PickerOverlay.keyPressEvent`'s Left/Right/Up/Down handling.
+            let mut delta = egui::Vec2::ZERO;
+            if input.key_pressed(egui::Key::ArrowLeft) {
+                delta.x -= 1.0;
+            }
+            if input.key_pressed(egui::Key::ArrowRight) {
+                delta.x += 1.0;
+            }
+            if input.key_pressed(egui::Key::ArrowUp) {
+                delta.y -= 1.0;
+            }
+            if input.key_pressed(egui::Key::ArrowDown) {
+                delta.y += 1.0;
+            }
+            if delta != egui::Vec2::ZERO {
+                self.cursor_pos += delta;
+            }
+
+            if input.pointer.primary_clicked() || input.key_pressed(egui::Key::Enter) {
+                clicked_or_entered = true;
+            }
+            if input.key_pressed(egui::Key::Escape) {
+                cancelled = true;
+            }
+        });
+
+        let picked = if clicked_or_entered {
+            let image_pos = self.image_pos_for(ctx, self.cursor_pos);
+            Some(self.color_at(image_pos))
+        } else {
+            None
+        };
+
+        MagnifierInput { picked, cancelled }
+    }
+
     /// Direct port of `PickerOverlay.paintEvent`.
-    fn draw_magnifier(&self, ctx: &egui::Context, ui: &mut egui::Ui) {
+    pub fn draw(&self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let painter = ui.painter();
         let screen_rect = ctx.screen_rect();
 
@@ -198,37 +260,51 @@ impl MagnifierApp {
     }
 }
 
+/// Result of `MagnifierState::handle_input` for one frame: at most one of
+/// these will be set (a click/Enter picks, Esc cancels; both can't happen
+/// the same frame since Esc short-circuits nothing else here but callers
+/// should just check `picked` first).
+pub struct MagnifierInput {
+    pub picked: Option<Rgb>,
+    pub cancelled: bool,
+}
+
+/// Standalone eframe app wrapping a `MagnifierState`. Used by the CLI
+/// `magnify` subcommand, which owns its own window/event loop via
+/// `run()`. An app that wants to embed the magnifier as a *mode* inside
+/// a bigger window (e.g. a "pick" button in a larger UI) should hold a
+/// `MagnifierState` directly instead and call `handle_input`/`draw` from
+/// its own `update()` — see `MagnifierState`'s doc comment.
+struct MagnifierApp {
+    state: MagnifierState,
+    result_tx: std::sync::mpsc::Sender<Rgb>,
+}
+
+impl MagnifierApp {
+    fn new(screenshot: RgbImage, result_tx: std::sync::mpsc::Sender<Rgb>) -> Self {
+        Self {
+            state: MagnifierState::new(screenshot),
+            result_tx,
+        }
+    }
+}
+
 impl eframe::App for MagnifierApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ---- input: mouse (equivalent of mouseMoveEvent/mousePressEvent) ----
-        let mut picked: Option<Rgb> = None;
-        let mut cancelled = false;
-
-        ctx.input(|input| {
-            if let Some(pos) = input.pointer.latest_pos() {
-                self.cursor_pos = pos;
-            }
-            if input.pointer.primary_clicked() || input.key_pressed(egui::Key::Enter) {
-                let image_pos = self.image_pos_for(ctx, self.cursor_pos);
-                picked = Some(self.color_at(image_pos));
-            }
-            if input.key_pressed(egui::Key::Escape) {
-                cancelled = true;
-            }
-        });
+        let input = self.state.handle_input(ctx);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
-                self.draw_magnifier(ctx, ui);
+                self.state.draw(ctx, ui);
             });
 
-        if let Some(color) = picked {
+        if let Some(color) = input.picked {
             // Ignore send errors: if the receiver was already dropped
             // (caller gave up), there's nothing useful to do here.
             let _ = self.result_tx.send(color);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        } else if cancelled {
+        } else if input.cancelled {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else {
             // Repaint continuously so the magnifier follows the mouse

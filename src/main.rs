@@ -1,3 +1,4 @@
+mod app_minimal;
 mod color;
 mod magnifier;
 mod portal;
@@ -33,6 +34,10 @@ enum Command {
     /// Open a fullscreen pixel-zoom magnifier to pick a color precisely.
     /// Move the mouse to preview, left-click (or Enter) to pick, Esc to cancel.
     Magnify,
+    /// Minimal GUI: one color field + magnifier button, in a single eframe
+    /// window (proof of concept for embedding the magnifier as a mode
+    /// instead of a separate window — see app_minimal.rs).
+    Gui,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -60,6 +65,12 @@ fn main() -> anyhow::Result<()> {
                 Ok(())
             }
         };
+    }
+
+    // `Gui` also needs to own the real main thread for the same reason as
+    // `Magnify` above (winit/eframe requirement on Linux).
+    if matches!(cli.command, Command::Gui) {
+        return app_minimal::main();
     }
 
     tokio::runtime::Builder::new_multi_thread()
@@ -95,6 +106,7 @@ async fn run_async(cli: Cli) -> anyhow::Result<()> {
             print_comparison(a, b, large_text);
         }
         Command::Magnify => unreachable!("handled in main() before the async runtime starts"),
+        Command::Gui => unreachable!("handled in main() before the async runtime starts"),
     }
 
     Ok(())
