@@ -1,0 +1,16 @@
+[package]
+name = "colorpick"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal CLI: pick a color from the screen via xdg-desktop-portal (GNOME/KDE compatible), compare two colors, check WCAG contrast."
+license = "MIT"
+
+[dependencies]
+ashpd = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[[bin]]
+name = "colorpick"
+path = "src/main.rs"
