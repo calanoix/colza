@@ -1,7 +1,0 @@
-Impact,Rule ID,Rule,Description,Best Practice,Element HTML,Selector
-critical,image-alt,Images must have alternative text,Ensure <img> elements have alternative text or a role of none or presentation,No,"<img src=""https://torrindex.net/images/icon-magnet.gif"">",a:nth-child(4) > img
-critical,image-alt,Images must have alternative text,Ensure <img> elements have alternative text or a role of none or presentation,No,"<img src=""https://torrindex.net/images/icon-magnet.gif"">",#d2 > a:nth-child(1) > img
-critical,select-name,Select element must have an accessible name,Ensure select element has an accessible name,No,"<select name=""cat"" id=""cat"">",select
-serious,color-contrast,Elements must meet minimum color contrast ratio thresholds,Ensure the contrast between foreground and background colors meets WCAG 2 AA minimum contrast ratio thresholds,No,"<a href=""magnet:?xt=urn:btih:..."">",#d > a:nth-child(4)
-serious,color-contrast,Elements must meet minimum color contrast ratio thresholds,Ensure the contrast between foreground and background colors meets WCAG 2 AA minimum contrast ratio thresholds,No,"<a href=""magnet:?xt=urn:btih:..."">",#d2 > a:nth-child(1)
-serious,definition-list,"<dl> elements must only directly contain properly-ordered <dt> and <dd> groups, <script>, <template> or <div> elements",Ensure <dl> elements are structured correctly,No,"<dl id=""meta-left"" class=""col-meta"">",#meta-left

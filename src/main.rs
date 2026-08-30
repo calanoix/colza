@@ -1,4 +1,5 @@
 mod color;
+mod magnifier;
 mod portal;
 
 use clap::{Parser, Subcommand};
@@ -29,12 +30,45 @@ enum Command {
         #[arg(long)]
         large_text: bool,
     },
+    /// Open a fullscreen pixel-zoom magnifier to pick a color precisely.
+    /// Move the mouse to preview, left-click (or Enter) to pick, Esc to cancel.
+    Magnify,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // `Magnify` needs eframe/winit's event loop to run directly on the
+    // real main thread (most Linux windowing backends require this and
+    // may misbehave or panic otherwise), so it can't go through
+    // `#[tokio::main]` like the other subcommands. We build a small,
+    // short-lived tokio runtime just to make the one async portal call,
+    // then drop it and run eframe synchronously on this same thread.
+    if matches!(cli.command, Command::Magnify) {
+        let screenshot = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(portal::capture_screen())?;
+
+        return match magnifier::run(screenshot)? {
+            Some(color) => {
+                println!("{color}");
+                Ok(())
+            }
+            None => {
+                println!("Cancelled.");
+                Ok(())
+            }
+        };
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_async(cli))
+}
+
+async fn run_async(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Pick => {
             let color = portal::pick_color().await?;
@@ -60,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
 
             print_comparison(a, b, large_text);
         }
+        Command::Magnify => unreachable!("handled in main() before the async runtime starts"),
     }
 
     Ok(())
