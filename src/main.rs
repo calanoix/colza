@@ -2,6 +2,9 @@ mod app_minimal;
 mod color;
 mod magnifier;
 mod portal;
+mod runtime;
+mod screencast;
+mod token_store;
 
 use clap::{Parser, Subcommand};
 use color::{Rgb, contrast_ratio, wcag_level};
@@ -46,16 +49,18 @@ fn main() -> anyhow::Result<()> {
     // `Magnify` needs eframe/winit's event loop to run directly on the
     // real main thread (most Linux windowing backends require this and
     // may misbehave or panic otherwise), so it can't go through
-    // `#[tokio::main]` like the other subcommands. We build a small,
-    // short-lived tokio runtime just to make the one async portal call,
-    // then drop it and run eframe synchronously on this same thread.
+    // `#[tokio::main]` like the other subcommands. Instead we `block_on`
+    // the one async portal call on the shared runtime, then run eframe
+    // synchronously on this same thread.
+    //
+    // The runtime is `runtime::shared()` rather than one built here and
+    // dropped: ashpd caches its D-Bus connection process-wide and binds it
+    // to the reactor it first saw, so a runtime that dies leaves that
+    // connection pointing at nothing. See runtime.rs.
     if matches!(cli.command, Command::Magnify) {
-        let screenshot = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(portal::capture_screen())?;
+        let (capture, first_frame) = runtime::shared()?.block_on(screencast::Capture::open())?;
 
-        return match magnifier::run(screenshot)? {
+        return match magnifier::run(first_frame, capture)? {
             Some(color) => {
                 println!("{color}");
                 Ok(())
@@ -73,10 +78,7 @@ fn main() -> anyhow::Result<()> {
         return app_minimal::main();
     }
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(run_async(cli))
+    runtime::shared()?.block_on(run_async(cli))
 }
 
 async fn run_async(cli: Cli) -> anyhow::Result<()> {

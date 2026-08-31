@@ -26,7 +26,7 @@ use image::RgbImage;
 
 use crate::color::Rgb;
 use crate::magnifier::MagnifierState;
-use crate::portal;
+use crate::screencast::Capture;
 
 /// Dedicated id for the magnifier's viewport, so we can refer to the same
 /// native window across frames (open it once, keep updating it, close it
@@ -55,16 +55,26 @@ enum Target {
 enum Mode {
     /// Just the main window.
     Normal,
-    /// 🖍 was clicked for `Target`; a background thread is capturing the
-    /// screen. The main window stays visible and responsive during this —
+    /// 🖍 was clicked for `Target`; a background task is opening a capture
+    /// session. The main window stays visible and responsive during this —
     /// capture happens off the UI thread specifically so it can never
     /// block `update()` (a previous version of this file deadlocked here).
-    Capturing(Target, std::sync::mpsc::Receiver<anyhow::Result<RgbImage>>),
-    /// Screenshot in hand; the magnifier viewport is open and sampling
-    /// `state` for `Target`. Boxed because `MagnifierState` owns a
-    /// full-resolution `RgbImage` and we don't want that heavy to sit
-    /// inline in `Mode` while we're in `Normal`/`Capturing`.
-    Magnifying(Target, Box<MagnifierState>),
+    Capturing(
+        Target,
+        std::sync::mpsc::Receiver<anyhow::Result<(Capture, RgbImage)>>,
+    ),
+    /// First frame in hand; the magnifier viewport is open and sampling
+    /// `state` for `Target`.
+    ///
+    /// The `Capture` is held here for the whole time the loupe is up, which
+    /// is what makes it a *live* view: `update()` pulls the newest frame
+    /// from it each repaint. Dropping this variant (pick or cancel) stops
+    /// the stream and closes the portal session.
+    ///
+    /// `MagnifierState` is boxed because it owns a full-resolution
+    /// `RgbImage` and we don't want that heavy to sit inline in `Mode`
+    /// while we're in `Normal`/`Capturing`.
+    Magnifying(Target, Box<MagnifierState>, Capture),
 }
 
 /// Parses `#rrggbb`, `rrggbb`, or `rgb(r, g, b)` — direct port of
@@ -258,23 +268,45 @@ impl MinimalApp {
         self.update_contrast();
     }
 
-    /// Kicks off the pick flow for `target`: spawn a plain OS thread that
-    /// builds its own short-lived tokio runtime just to run
-    /// `portal::capture_screen()` (same one-shot-runtime trick `main.rs`
-    /// uses for the `magnify` subcommand), and send the result back over a
-    /// channel. Returns immediately — nothing here blocks the calling
-    /// `update()` frame (blocking here previously caused a freeze).
+    /// Kicks off the pick flow for `target`: spawn `Capture::open()` as a
+    /// task on the process-wide runtime and send the resulting live session
+    /// (plus its first frame) back over a channel. Returns immediately —
+    /// nothing here blocks the calling `update()` frame (blocking here
+    /// previously caused a freeze).
+    ///
+    /// A `tokio::spawn` on `runtime::shared()`, rather than the OS thread +
+    /// per-click `current_thread` runtime this used to do: that pattern
+    /// panicked on the *second* pick once ashpd moved to its tokio backend,
+    /// because ashpd's cached D-Bus connection outlived the runtime it was
+    /// bound to (see runtime.rs). With one long-lived multi-threaded
+    /// runtime, spawning is both correct and cheaper than a thread.
+    ///
+    /// Thread topology for a "Pick" click: UI thread spawns a task ->
+    /// runtime worker drives the portal D-Bus round-trip -> a dedicated
+    /// `colza-pipewire` thread runs the blocking PipeWire mainloop for as
+    /// long as the loupe is open -> the session handle comes back to the UI
+    /// thread via the `rx` channel below, and frames after the first arrive
+    /// through the handle's own mutex slot. Every hop is a channel, a mutex
+    /// or a task boundary, not a re-entrant lock, so this doesn't
+    /// reintroduce the deadlock class
+    /// the app already fixed once.
     fn start_picking(&mut self, target: Target) {
         let (tx, rx) = std::sync::mpsc::channel();
 
-        std::thread::spawn(move || {
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(anyhow::Error::from)
-                .and_then(|rt| rt.block_on(portal::capture_screen()));
-            let _ = tx.send(result);
-        });
+        match crate::runtime::shared() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    let _ = tx.send(Capture::open().await);
+                });
+            }
+            // Sending the error rather than dropping `tx` silently: the
+            // `Capturing` arm of `update()` surfaces a received `Err` to
+            // the user, whereas a hung-up channel would just look like a
+            // pick that never finished.
+            Err(err) => {
+                let _ = tx.send(Err(err));
+            }
+        }
 
         self.mode = Mode::Capturing(target, rx);
     }
@@ -400,8 +432,12 @@ impl eframe::App for MinimalApp {
             Mode::Normal => {}
 
             Mode::Capturing(target, rx) => match rx.try_recv() {
-                Ok(Ok(img)) => {
-                    self.mode = Mode::Magnifying(*target, Box::new(MagnifierState::new(img)));
+                Ok(Ok((capture, first_frame))) => {
+                    self.mode = Mode::Magnifying(
+                        *target,
+                        Box::new(MagnifierState::new(first_frame)),
+                        capture,
+                    );
                     // Without this, nothing schedules the *next* frame —
                     // the one that will actually call show_viewport_immediate
                     // for the magnifier below — until some external input
@@ -421,15 +457,28 @@ impl eframe::App for MinimalApp {
                     ctx.request_repaint_after(std::time::Duration::from_millis(16));
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    eprintln!("screen capture thread died without a result");
+                    eprintln!("screen capture task ended without a result");
                     self.mode = Mode::Normal;
                 }
             },
 
-            Mode::Magnifying(target, state) => {
+            Mode::Magnifying(target, state, capture) => {
                 let target = *target;
                 let mut should_close = false;
                 let mut picked_color = None;
+
+                // The live feed, in one line: swap in the newest frame the
+                // capture thread has produced, if any. `None` means nothing
+                // new arrived since the last repaint, so the existing image
+                // stays — the loupe simply keeps showing the last thing the
+                // screen looked like. The assignment is a move, not a copy,
+                // so resolution doesn't matter here.
+                //
+                // Done before `handle_input` so that a click in this frame
+                // samples the frame the user is actually looking at.
+                if let Some(frame) = capture.take_frame() {
+                    state.screenshot = frame;
+                }
 
                 ctx.show_viewport_immediate(
                     magnifier_viewport_id(),
@@ -481,6 +530,16 @@ impl eframe::App for MinimalApp {
                     // transition above: force the next frame to be
                     // scheduled rather than relying on it happening to
                     // coincide with another input event.
+                    ctx.request_repaint();
+                } else {
+                    // Requested on the *parent* context, not just the
+                    // viewport's own inside the closure above. A viewport
+                    // opened with `show_viewport_immediate` is only painted
+                    // as part of the parent's pass, so without this the
+                    // loupe redraws only when some input event happens to
+                    // wake the parent — which is enough to track the mouse
+                    // (mouse motion *is* an event) but not to show a live
+                    // feed of a video playing under a stationary cursor.
                     ctx.request_repaint();
                 }
             }

@@ -4,8 +4,10 @@
 //! Same trick as `picker.py` and `shmooz`: the window covers the whole
 //! screen and tracks the mouse *inside itself*, so we get "global" cursor
 //! following without evdev or any special permissions. The only different
-//! piece is where the screen image comes from (`portal::capture_screen`
-//! instead of shelling out to `spectacle`/`grim`).
+//! piece is where the screen image comes from (`screencast::Capture`
+//! instead of shelling out to `spectacle`/`grim`) — and that it is a live
+//! PipeWire feed rather than a still, so the sampled color tracks a playing
+//! video under the loupe.
 //!
 //! Correspondence with `picker.py`:
 //! - `PickerOverlay.__init__`            -> `MagnifierApp::new`
@@ -34,11 +36,16 @@ const LOUPE_OFFSET: f32 = 20.0;
 /// Runs the fullscreen magnifier and blocks until the user picks a color
 /// (left click / Enter) or cancels (Escape / closes the window).
 ///
-/// `screenshot` is the already-captured, already-decoded full-screen image
-/// (see `portal::capture_screen`); capturing happens *before* opening the
-/// window so the picked color always corresponds to what the screen looked
-/// like right before the overlay appeared, not a stale later frame.
-pub fn run(screenshot: RgbImage) -> anyhow::Result<Option<Rgb>> {
+/// `first_frame` is the image the loupe shows immediately, and `capture` is
+/// the live session it keeps pulling newer frames from — so parking the
+/// loupe on a playing video tracks the video rather than freezing on the
+/// frame that happened to be on screen when the overlay opened. `capture`
+/// is dropped when this returns, which stops the stream and closes the
+/// portal session.
+pub fn run(
+    first_frame: RgbImage,
+    capture: crate::screencast::Capture,
+) -> anyhow::Result<Option<Rgb>> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_fullscreen(true)
@@ -54,7 +61,7 @@ pub fn run(screenshot: RgbImage) -> anyhow::Result<Option<Rgb>> {
     // into the App and fired exactly once, right before the app requests
     // the window to close.
     let (tx, rx) = std::sync::mpsc::channel::<Rgb>();
-    let app = MagnifierApp::new(screenshot, tx);
+    let app = MagnifierApp::new(first_frame, capture, tx);
 
     eframe::run_native(
         "colorpick magnifier",
@@ -75,7 +82,15 @@ pub fn run(screenshot: RgbImage) -> anyhow::Result<Option<Rgb>> {
 /// subcommand, own eframe event loop) and an embedding app (e.g. a
 /// "pick" mode inside a bigger eframe window) can hold one of these and
 /// call `draw` / `handle_input` directly from their own `update()`.
+///
+/// This type deliberately knows nothing about PipeWire: to drive a live
+/// view, the owner assigns a newer image to `screenshot` between frames
+/// (both callers do this from `Capture::take_frame()`). Sampling reads
+/// straight out of that `RgbImage` on the CPU — no GPU texture upload — so
+/// replacing it per frame costs only the move.
 pub struct MagnifierState {
+    /// The image being sampled. Public so an owner driving a live feed can
+    /// swap in a newer frame; a plain assignment is enough.
     pub screenshot: RgbImage,
     pub cursor_pos: egui::Pos2,
 }
@@ -292,13 +307,21 @@ pub struct MagnifierInput {
 /// its own `update()` — see `MagnifierState`'s doc comment.
 struct MagnifierApp {
     state: MagnifierState,
+    /// Held for the lifetime of the overlay so the feed stays live; see
+    /// `run`'s doc comment.
+    capture: crate::screencast::Capture,
     result_tx: std::sync::mpsc::Sender<Rgb>,
 }
 
 impl MagnifierApp {
-    fn new(screenshot: RgbImage, result_tx: std::sync::mpsc::Sender<Rgb>) -> Self {
+    fn new(
+        first_frame: RgbImage,
+        capture: crate::screencast::Capture,
+        result_tx: std::sync::mpsc::Sender<Rgb>,
+    ) -> Self {
         Self {
-            state: MagnifierState::new(screenshot),
+            state: MagnifierState::new(first_frame),
+            capture,
             result_tx,
         }
     }
@@ -306,6 +329,13 @@ impl MagnifierApp {
 
 impl eframe::App for MagnifierApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Swap in the newest frame before reading input, so a click samples
+        // the image the user is actually looking at. `None` means nothing
+        // new since the last repaint — keep showing what we have.
+        if let Some(frame) = self.capture.take_frame() {
+            self.state.screenshot = frame;
+        }
+
         let input = self.state.handle_input(ctx);
 
         egui::CentralPanel::default()
