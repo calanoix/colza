@@ -49,6 +49,7 @@ use ashpd::desktop::{
 };
 use ashpd::WindowIdentifier;
 use image::RgbImage;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Frames per second requested from the compositor.
@@ -62,6 +63,41 @@ use std::sync::{Arc, Mutex};
 /// It is a *maximum*, not a promise — compositors generally only send a
 /// frame when something actually changed, so a static screen costs nothing.
 const FRAMERATE: u32 = 30;
+
+/// How long [`Capture::open`] waits for the compositor's first frame before
+/// giving up.
+///
+/// This is not about slow machines: by the time we wait here, the portal
+/// round-trip (and the picker dialog, on the runs that show one) is already
+/// done, and a compositor sends the current screen contents as soon as the
+/// stream connects. Several seconds is therefore very generous for the happy
+/// path, and the timeout exists for the paths that would otherwise hang
+/// forever — see [`Capture::no_frame_error`] for what those are.
+const FIRST_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Counters the PipeWire thread bumps as it goes, read only when something
+/// went wrong.
+///
+/// Their whole purpose is to turn "no frame arrived" — which has several
+/// very different causes, one of which is a genuine limitation of this
+/// module — into a message that says which one happened. Without them a
+/// DMA-BUF-only compositor and a sleeping monitor are indistinguishable.
+///
+/// `Relaxed` throughout: these are diagnostics, never used to synchronise
+/// anything. The frame handoff itself goes through the `latest` mutex.
+#[derive(Default)]
+struct StreamDiagnostics {
+    /// `param_changed` successfully parsed a video format.
+    format_negotiated: AtomicBool,
+    /// Buffers successfully dequeued from the stream.
+    buffers_dequeued: AtomicU32,
+    /// Buffers whose plane had no CPU-readable data. This is the DMA-BUF
+    /// signature: the compositor handed us GPU memory, which this module
+    /// deliberately does not import.
+    planes_unmapped: AtomicU32,
+    /// Buffers that made it all the way to an `RgbImage`.
+    frames_decoded: AtomicU32,
+}
 
 /// A live ScreenCast session: a portal session, a PipeWire stream, and the
 /// thread pumping frames out of it.
@@ -82,6 +118,7 @@ pub struct Capture {
     /// closing the session tears the PipeWire node down. `Option` only so
     /// `Drop` can move it out.
     session: Option<Session<'static, Screencast<'static>>>,
+    diagnostics: Arc<StreamDiagnostics>,
 }
 
 impl Capture {
@@ -158,6 +195,7 @@ impl Capture {
         let pw_fd = proxy.open_pipe_wire_remote(&session).await?;
 
         let latest: Arc<Mutex<Option<RgbImage>>> = Arc::new(Mutex::new(None));
+        let diagnostics: Arc<StreamDiagnostics> = Arc::default();
         let (stop, stop_rx) = pipewire::channel::channel::<()>();
         // Signals "the first frame is in the slot" or "setup failed". A
         // oneshot rather than an mpsc because `oneshot::Sender::send` is
@@ -169,12 +207,18 @@ impl Capture {
             .name("colza-pipewire".into())
             .spawn({
                 let latest = Arc::clone(&latest);
+                let diagnostics = Arc::clone(&diagnostics);
                 move || {
                     let ready: ReadySignal =
                         std::rc::Rc::new(std::cell::RefCell::new(Some(ready_tx)));
-                    if let Err(err) =
-                        run_stream(pw_fd, node_id, latest, stop_rx, std::rc::Rc::clone(&ready))
-                    {
+                    if let Err(err) = run_stream(
+                        pw_fd,
+                        node_id,
+                        latest,
+                        diagnostics,
+                        stop_rx,
+                        std::rc::Rc::clone(&ready),
+                    ) {
                         match ready.borrow_mut().take() {
                             // Failed before the first frame — report it to
                             // `open()`, which is still waiting.
@@ -192,29 +236,82 @@ impl Capture {
                 }
             })?;
 
-        match ready_rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => return Err(err),
+        // Assembled *before* waiting for the first frame, so that every
+        // error path below is a plain `return` and still stops the thread
+        // and closes the portal session — `Drop` does it. Duplicating that
+        // teardown on each failure branch is how one of them ends up
+        // forgetting it.
+        let capture = Self {
+            latest,
+            stop,
+            thread: Some(thread),
+            session: Some(session),
+            diagnostics,
+        };
+
+        match tokio::time::timeout(FIRST_FRAME_TIMEOUT, ready_rx).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(err))) => return Err(err),
             // The sender was dropped without sending: the thread panicked,
             // or returned `Ok` without ever producing a frame.
-            Err(_) => anyhow::bail!("the screencast thread stopped before producing a frame"),
+            Ok(Err(_)) => {
+                anyhow::bail!("the screencast thread stopped before producing a frame")
+            }
+            // The reason this timeout exists at all: the stream is alive and
+            // reported no error, but no frame ever landed. Before this
+            // branch existed the `await` simply never returned and the app
+            // hung with nothing on stderr.
+            Err(_elapsed) => return Err(capture.no_frame_error()),
         }
 
-        let first = latest
-            .lock()
-            .expect("frame slot mutex poisoned by the pipewire thread")
-            .take()
+        let first = capture
+            .take_frame()
             .ok_or_else(|| anyhow::anyhow!("screencast signalled a frame but the slot was empty"))?;
 
-        Ok((
-            Self {
-                latest,
-                stop,
-                thread: Some(thread),
-                session: Some(session),
-            },
-            first,
-        ))
+        Ok((capture, first))
+    }
+
+    /// Builds the error for "waited [`FIRST_FRAME_TIMEOUT`] and got no
+    /// frame", naming the most likely cause from what the stream thread
+    /// actually observed.
+    ///
+    /// Worth the trouble because the causes are genuinely different
+    /// problems for whoever reads the message — one is a limitation of this
+    /// code, one is the screen being off, one is a broken connection — and
+    /// they are indistinguishable from the outside.
+    fn no_frame_error(&self) -> anyhow::Error {
+        let d = &self.diagnostics;
+        let dequeued = d.buffers_dequeued.load(Ordering::Relaxed);
+        let unmapped = d.planes_unmapped.load(Ordering::Relaxed);
+        let decoded = d.frames_decoded.load(Ordering::Relaxed);
+        let negotiated = d.format_negotiated.load(Ordering::Relaxed);
+        let secs = FIRST_FRAME_TIMEOUT.as_secs();
+
+        if unmapped > 0 {
+            anyhow::anyhow!(
+                "no readable frame after {secs}s: the compositor delivered {unmapped} buffer(s) \
+                 with no CPU-mappable data, which means DMA-BUF (GPU memory). colza only reads \
+                 shared-memory buffers, so this compositor/driver combination isn't supported \
+                 yet — importing DMA-BUF would need an EGL path"
+            )
+        } else if dequeued == 0 && !negotiated {
+            anyhow::anyhow!(
+                "no frame after {secs}s and the video format was never negotiated: the PipeWire \
+                 stream likely never reached the compositor's node (check that the screen-share \
+                 permission wasn't revoked mid-session)"
+            )
+        } else if dequeued == 0 {
+            anyhow::anyhow!(
+                "no frame after {secs}s: the video format was negotiated but the compositor sent \
+                 no buffers. The captured monitor may be asleep or powered off"
+            )
+        } else {
+            anyhow::anyhow!(
+                "no frame after {secs}s: {dequeued} buffer(s) arrived and were mappable but only \
+                 {decoded} decoded. Likely an unexpected pixel format, in which case earlier \
+                 stderr output names it, or buffers shorter than the negotiated size"
+            )
+        }
     }
 
     /// Takes the newest frame, if one has arrived since the last call.
@@ -281,6 +378,7 @@ fn run_stream(
     pw_fd: std::os::fd::OwnedFd,
     node_id: u32,
     latest: Arc<Mutex<Option<RgbImage>>>,
+    diagnostics: Arc<StreamDiagnostics>,
     stop_rx: pipewire::channel::Receiver<()>,
     ready: ReadySignal,
 ) -> anyhow::Result<()> {
@@ -339,6 +437,8 @@ fn run_stream(
 
     let format_for_process = Rc::clone(&format);
     let format_for_param_changed = Rc::clone(&format);
+    let diag_for_process = Arc::clone(&diagnostics);
+    let diag_for_param_changed = Arc::clone(&diagnostics);
 
     // `::<()>` because this listener carries no PipeWire-managed user data
     // — the state the callbacks need is captured by the closures instead.
@@ -357,14 +457,21 @@ fn run_stream(
             if media_type != MediaType::Video || media_subtype != MediaSubtype::Raw {
                 return;
             }
-            if let Err(err) = format_for_param_changed.borrow_mut().parse(param) {
-                eprintln!("colza: failed to parse negotiated video format: {err}");
+            match format_for_param_changed.borrow_mut().parse(param) {
+                Ok(_) => diag_for_param_changed
+                    .format_negotiated
+                    .store(true, Ordering::Relaxed),
+                Err(err) => eprintln!("colza: failed to parse negotiated video format: {err}"),
             }
         })
         .process(move |stream, _user_data| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
+            diag_for_process
+                .buffers_dequeued
+                .fetch_add(1, Ordering::Relaxed);
+
             let datas = buffer.datas_mut();
             let Some(plane) = datas.first_mut() else {
                 return;
@@ -379,7 +486,15 @@ fn run_stream(
             // this rather than assuming a tightly packed buffer.
             let stride = plane.chunk().stride() as usize;
 
+            // `None` here is the DMA-BUF case: the buffer holds a GPU handle
+            // rather than mappable memory. Counted rather than just skipped,
+            // because it is the one failure mode that means "unsupported"
+            // instead of "try again", and `no_frame_error` reports it as
+            // such.
             let Some(chunk_data) = plane.data() else {
+                diag_for_process
+                    .planes_unmapped
+                    .fetch_add(1, Ordering::Relaxed);
                 return;
             };
 
@@ -395,6 +510,9 @@ fn run_stream(
             let Some(img) = frame_to_rgb(chunk_data, width, height, stride, info.format()) else {
                 return;
             };
+            diag_for_process
+                .frames_decoded
+                .fetch_add(1, Ordering::Relaxed);
 
             // Overwrites whatever the consumer hasn't taken yet: only the
             // newest frame is worth anything, and this is what keeps a slow
