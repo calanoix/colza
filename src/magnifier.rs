@@ -126,8 +126,23 @@ impl MagnifierState {
         // closure only reads `input` and sets plain local flags; anything
         // that needs `ctx` again happens after the closure returns.
         ctx.input(|input| {
-            if let Some(pos) = input.pointer.latest_pos() {
-                self.cursor_pos = pos;
+            // Only snap `cursor_pos` to the physical mouse position when
+            // the mouse actually moved *this frame* (or on the very first
+            // frame, when we haven't seen a pointer position yet). egui
+            // redraws continuously while this viewport is open, and
+            // `pointer.latest_pos()` returns the mouse's current position
+            // on every single frame regardless of whether it moved — so
+            // unconditionally assigning it here (as a previous version of
+            // this function did) overwrote arrow-key nudges one frame
+            // after they were applied, which looked like the loupe
+            // flashing in place instead of moving. `pointer.delta()` is
+            // egui's per-frame movement vector and is exactly zero when
+            // the mouse hasn't moved, so it's the right signal to gate on.
+            let mouse_moved = input.pointer.delta() != egui::Vec2::ZERO;
+            if mouse_moved || self.cursor_pos == egui::Pos2::ZERO {
+                if let Some(pos) = input.pointer.latest_pos() {
+                    self.cursor_pos = pos;
+                }
             }
 
             // Arrow keys nudge the cursor by one logical pixel, mirroring
