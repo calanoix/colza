@@ -402,6 +402,16 @@ impl eframe::App for MinimalApp {
             Mode::Capturing(target, rx) => match rx.try_recv() {
                 Ok(Ok(img)) => {
                     self.mode = Mode::Magnifying(*target, Box::new(MagnifierState::new(img)));
+                    // Without this, nothing schedules the *next* frame —
+                    // the one that will actually call show_viewport_immediate
+                    // for the magnifier below — until some external input
+                    // event (e.g. mouse movement) happens to trigger a
+                    // redraw. That's why the loupe used to only appear
+                    // once you moved the mouse: the mode flip above is
+                    // silent otherwise. request_repaint() asks winit to
+                    // schedule another update() right away regardless of
+                    // input.
+                    ctx.request_repaint();
                 }
                 Ok(Err(err)) => {
                     eprintln!("screen capture failed: {err}");
@@ -467,6 +477,11 @@ impl eframe::App for MinimalApp {
                         magnifier_viewport_id(),
                         egui::ViewportCommand::Close,
                     );
+                    // Same reasoning as the Capturing -> Magnifying
+                    // transition above: force the next frame to be
+                    // scheduled rather than relying on it happening to
+                    // coincide with another input event.
+                    ctx.request_repaint();
                 }
             }
         }

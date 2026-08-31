@@ -36,7 +36,7 @@ pub async fn pick_color() -> anyhow::Result<Rgb> {
 pub async fn capture_screen() -> anyhow::Result<RgbImage> {
     let response = ashpd::desktop::screenshot::Screenshot::request()
         .interactive(false)
-        .modal(true)
+        .modal(false)
         .send()
         .await?
         .response()?;
