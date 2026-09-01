@@ -42,7 +42,7 @@ enum Mode {
     /// `state` for `Target`.
     ///
     /// Holding the `ScreenSource` here for the whole time the loupe is up
-    /// is what makes it a live view: `update()` pulls the newest frame from
+    /// is what makes it a live view: `ui()` pulls the newest frame from
     /// it each repaint. Dropping this variant (pick or cancel) stops the
     /// stream and closes the portal session.
     Magnifying(Target, Box<MagnifierState>, ScreenSource),
@@ -120,8 +120,12 @@ impl ColorRowState {
                 4.0,
                 egui::Color32::from_rgb(self.color.r, self.color.g, self.color.b),
             );
-            ui.painter()
-                .rect_stroke(rect, 4.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(0x88)));
+            ui.painter().rect_stroke(
+                rect,
+                4.0,
+                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(0x88)),
+                egui::StrokeKind::Inside,
+            );
 
             let field = ui.add(
                 egui::TextEdit::singleline(&mut self.hex_text).desired_width(70.0),
@@ -194,14 +198,7 @@ impl App {
     /// Kicks off the pick flow for `target`: spawns `screencast::open_best()`
     /// as a task on the shared runtime and sends the resulting
     /// `ScreenSource` (plus its first frame) back over a channel. Returns
-    /// immediately — nothing here blocks the calling `update()` frame.
-    ///
-    /// Thread topology for a "Pick" click: the UI thread spawns a task, a
-    /// runtime worker drives the portal D-Bus round-trip, a dedicated
-    /// PipeWire thread runs the blocking mainloop for as long as the loupe
-    /// is open, and the session handle comes back to the UI thread via the
-    /// `rx` channel below (later frames arrive through the handle's own
-    /// mutex slot).
+    /// immediately — nothing here blocks the calling `ui()` frame.
     fn start_picking(&mut self, target: Target) {
         let (tx, rx) = std::sync::mpsc::channel();
 
@@ -251,14 +248,25 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Garantit qu'aucun fond noir opaque n'est appliqué par défaut avant le rendu
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // eframe 0.36 hands us the root Ui directly rather than a
+        // Context; ctx is still needed below for viewport commands and
+        // show_viewport_immediate, so it's grabbed once up front.
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
+
         // Main window: always drawn, every frame, regardless of mode. This
         // is what keeps it visible while the loupe viewport is up.
         let picking = !matches!(self.mode, Mode::Normal);
         let mut pick_target: Option<Target> = None;
         let mut contrast_dirty = false;
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("colza");
             ui.add_space(4.0);
 
@@ -290,8 +298,12 @@ impl eframe::App for App {
                     4.0,
                     egui::Color32::from_rgb(self.bg.color.r, self.bg.color.g, self.bg.color.b),
                 );
-                ui.painter()
-                    .rect_stroke(rect, 4.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(0x88)));
+                ui.painter().rect_stroke(
+                    rect,
+                    4.0,
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_gray(0x88)),
+                    egui::StrokeKind::Inside,
+                );
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -337,15 +349,8 @@ impl eframe::App for App {
             Mode::Capturing(target, rx) => match rx.try_recv() {
                 Ok(Ok((source, first_frame))) => {
                     let mut state = MagnifierState::new(first_frame);
-                    // Labels the loupe when we fell back to a still
-                    // screenshot, so a frozen image with a cursor in it
-                    // reads as the degraded mode rather than a bug.
                     state.live = source.is_live();
                     self.mode = Mode::Magnifying(*target, Box::new(state), source);
-                    // Without this, nothing schedules the next frame — the
-                    // one that actually opens the magnifier viewport below
-                    // — until some external input event happens to trigger
-                    // a redraw.
                     ctx.request_repaint();
                 }
                 Ok(Err(err)) => {
@@ -366,9 +371,6 @@ impl eframe::App for App {
                 let mut should_close = false;
                 let mut picked_color = None;
 
-                // Swap in the newest frame the capture thread produced, if
-                // any, before handling input, so a click samples the frame
-                // the user is actually looking at.
                 if let Some(frame) = capture.take_frame() {
                     state.screenshot = frame;
                 }
@@ -380,14 +382,17 @@ impl eframe::App for App {
                         .with_decorations(false)
                         .with_always_on_top()
                         .with_transparent(true),
-                    |ctx, _class| {
+                    |ui, _class| {
+                        let ctx = ui.ctx().clone();
+                        let ctx = &ctx;
                         ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
 
                         let input = state.handle_input(ctx);
 
+                        // Frame::NONE empêche de peindre l'arrière-plan opaque du thème egui
                         egui::CentralPanel::default()
-                            .frame(egui::Frame::none())
-                            .show(ctx, |ui| {
+                            .frame(egui::Frame::NONE)
+                            .show(ui, |ui| {
                                 state.draw(ctx, ui);
                             });
 
@@ -416,12 +421,6 @@ impl eframe::App for App {
                     );
                     ctx.request_repaint();
                 } else {
-                    // Requested on the parent context, not just the
-                    // viewport's own inside the closure above: a viewport
-                    // opened with `show_viewport_immediate` is only painted
-                    // as part of the parent's pass, so without this the
-                    // loupe would only redraw when some input event
-                    // happened to wake the parent.
                     ctx.request_repaint();
                 }
             }
@@ -431,6 +430,7 @@ impl eframe::App for App {
 
 pub fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default().with_inner_size([320.0, 480.0]),
         ..Default::default()
     };

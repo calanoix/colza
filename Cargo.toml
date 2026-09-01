@@ -24,8 +24,8 @@ ashpd = { version = "0.13", default-features = false, features = ["tokio", "scre
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-eframe = "0.29"
-egui = "0.29"
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wayland", "glow"] }
+egui = "0.36"
 image = { version = "0.25", default-features = false, features = ["png"] }
 url = "2"
 

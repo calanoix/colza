@@ -38,6 +38,7 @@ pub fn run(
     capture: crate::screencast::ScreenSource,
 ) -> anyhow::Result<Option<Rgb>> {
     let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
             .with_fullscreen(true)
             .with_decorations(false)
@@ -71,7 +72,7 @@ pub fn run(
 /// reusable core: both the standalone `MagnifierApp` (CLI `magnify`
 /// subcommand, own eframe event loop) and the embedding `app::App` (a
 /// "pick" mode inside the main window) hold one of these and call
-/// `draw`/`handle_input` directly from their own `update()`.
+/// `draw`/`handle_input` directly from their own `ui()`.
 ///
 /// This type knows nothing about PipeWire: to drive a live view, the owner
 /// assigns a newer image to `screenshot` between frames (both callers do
@@ -109,7 +110,12 @@ impl MagnifierState {
     /// screenshot, accounting for the screenshot possibly being a
     /// different resolution than the logical window size (HiDPI).
     pub fn image_pos_for(&self, ctx: &egui::Context, logical: egui::Pos2) -> (u32, u32) {
-        let screen_rect = ctx.screen_rect();
+        // `Context::screen_rect()` was removed in egui 0.36; the
+        // viewport's rect now lives on `InputState`. Safe to call
+        // `ctx.input()` here: this function is never invoked from inside
+        // another `ctx.input(...)` closure (see the note on
+        // `handle_input` below for why that matters).
+        let screen_rect = ctx.input(|i| i.viewport_rect());
         let scale_x = self.screenshot.width() as f32 / screen_rect.width().max(1.0);
         let scale_y = self.screenshot.height() as f32 / screen_rect.height().max(1.0);
         (
@@ -129,11 +135,11 @@ impl MagnifierState {
 
         // `ctx.input(...)` holds an internal lock on egui's input state for
         // the duration of the closure. Calling anything that itself needs
-        // to lock `ctx` (like `ctx.screen_rect()`, which `image_pos_for`
-        // calls) from inside this closure would re-enter that lock and
-        // deadlock. So this closure only reads `input` and sets plain
-        // local flags; anything needing `ctx` again happens after it
-        // returns.
+        // to lock `ctx` (like `ctx.input(|i| i.viewport_rect())`, which
+        // `image_pos_for` calls) from inside this closure would re-enter
+        // that lock and deadlock. So this closure only reads `input` and
+        // sets plain local flags; anything needing `ctx` again happens
+        // after it returns.
         ctx.input(|input| {
             // Only snap `cursor_pos` to the physical mouse position when
             // the mouse actually moved this frame (or on the very first
@@ -189,7 +195,7 @@ impl MagnifierState {
 
     pub fn draw(&self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let painter = ui.painter();
-        let screen_rect = ctx.screen_rect();
+        let screen_rect = ctx.input(|i| i.viewport_rect());
 
         let cursor = self.cursor_pos;
         let half = (LOUPE_PX / 2) as i64;
@@ -252,11 +258,13 @@ impl MagnifierState {
             center_rect.expand(1.0),
             0.0,
             egui::Stroke::new(1.0_f32, egui::Color32::BLACK),
+            egui::StrokeKind::Inside,
         );
         painter.rect_stroke(
             center_rect,
             0.0,
             egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
+            egui::StrokeKind::Inside,
         );
 
         // Hex readout band under the loupe.
@@ -324,7 +332,7 @@ pub struct MagnifierInput {
 /// `magnify` subcommand, which owns its own window/event loop via `run()`.
 /// An app embedding the magnifier as a mode inside a bigger window (see
 /// `app::App`) holds a `MagnifierState` directly instead and calls
-/// `handle_input`/`draw` from its own `update()`.
+/// `handle_input`/`draw` from its own `ui()`.
 struct MagnifierApp {
     state: MagnifierState,
     /// Held for the lifetime of the overlay so the feed stays live.
@@ -349,7 +357,10 @@ impl MagnifierApp {
 }
 
 impl eframe::App for MagnifierApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
+
         // Swap in the newest frame before reading input, so a click
         // samples the image the user is actually looking at. `None` means
         // nothing new since the last repaint — keep showing what we have.
@@ -360,8 +371,8 @@ impl eframe::App for MagnifierApp {
         let input = self.state.handle_input(ctx);
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none())
-            .show(ctx, |ui| {
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| {
                 self.state.draw(ctx, ui);
             });
 
