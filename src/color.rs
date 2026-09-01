@@ -1,7 +1,7 @@
 //! Color representation and WCAG 2.x contrast math.
 //!
-//! Kept free of any Wayland/portal dependency so it's trivially unit-testable
-//! and reusable once a GUI is added later.
+//! Kept free of any Wayland/portal dependency so it's trivially
+//! unit-testable and reusable independently of the GUI.
 
 use std::fmt;
 
@@ -17,7 +17,7 @@ impl Rgb {
         Self { r, g, b }
     }
 
-    /// Build from the (f64, f64, f64) 0.0..=1.0 triple that ashpd's
+    /// Builds from the (f64, f64, f64) 0.0..=1.0 triple that ashpd's
     /// `Color::pick()` returns.
     pub fn from_unit_floats(r: f64, g: f64, b: f64) -> Self {
         let to_u8 = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -89,7 +89,7 @@ impl fmt::Display for WcagLevel {
     }
 }
 
-/// Classify a contrast ratio for normal-size text against the WCAG 2.x
+/// Classifies a contrast ratio for normal-size text against the WCAG 2.x
 /// thresholds (4.5:1 for AA, 7:1 for AAA; large text is 3:1 / 4.5:1).
 pub fn wcag_level(ratio: f64, large_text: bool) -> WcagLevel {
     if large_text {

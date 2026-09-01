@@ -1,46 +1,29 @@
-//! Screen capture via `org.freedesktop.portal.ScreenCast` + PipeWire,
-//! replacing the old `org.freedesktop.portal.Screenshot`-based
-//! `portal::capture_screen()`.
+//! Screen capture via `org.freedesktop.portal.ScreenCast` + PipeWire.
 //!
-//! Why swap portals at all: `Screenshot` has no `cursor_mode` knob, so the
-//! system cursor (a plain white arrow) always showed up baked into the
-//! captured PNG, which was visually confusing sitting on top of the
-//! magnifier's own crosshair. `ScreenCast`'s `SelectSourcesOptions` has an
-//! explicit `CursorMode` bitflag, and `CursorMode::Hidden` (the portal's
-//! own default) omits the cursor from the video frames entirely — no
-//! masking/cropping needed on our end.
+//! `ScreenCast`'s `SelectSourcesOptions` supports `CursorMode::Hidden`,
+//! which omits the mouse cursor from the video frames entirely — unlike
+//! `Screenshot` (`portal.rs`), which always bakes the cursor into the
+//! image. The cost is that `ScreenCast` hands back a raw PipeWire node id
+//! + fd instead of a finished image, so this module has to speak PipeWire
+//! to pull frames out of it.
 //!
-//! The cost of that swap: `Screenshot` handed us a finished PNG on disk.
-//! `ScreenCast` hands us a raw PipeWire node id + fd and expects *us* to
-//! speak PipeWire to pull frames out of it. That's most of this file.
-//!
-//! ## A live feed, not a snapshot
-//!
-//! This module used to be one-shot: open a session, pull exactly one
-//! frame, tear everything down. That made the magnifier a *still image* —
-//! park the loupe on a playing video and the color never changed, because
-//! there was nothing left running to notice.
-//!
-//! [`Capture`] instead keeps the session and the PipeWire stream alive and
-//! keeps overwriting a single "latest frame" slot for as long as the handle
-//! is held. The UI calls [`Capture::take_frame`] once per repaint and swaps
-//! in whatever arrived. Dropping the handle stops the stream and closes the
-//! portal session.
+//! [`Capture`] keeps the session and the PipeWire stream alive and
+//! continuously overwrites a single "latest frame" slot for as long as the
+//! handle is held, so the magnifier gets a live feed rather than a frozen
+//! snapshot — the loupe tracks a playing video, for example. The UI calls
+//! [`Capture::take_frame`] once per repaint and swaps in whatever arrived;
+//! dropping the handle stops the stream and closes the portal session.
 //!
 //! The slot is a `Mutex<Option<RgbImage>>` rather than a channel on
 //! purpose: a channel would queue full-screen frames whenever the UI
 //! repaints slower than the compositor produces them, which at 4K is tens
-//! of megabytes per second of pure backlog. Overwriting means a slow
-//! consumer drops intermediate frames — exactly the right behaviour when
-//! only the newest one has any value.
+//! of megabytes per second of backlog. Overwriting means a slow consumer
+//! drops intermediate frames, which is the right behavior when only the
+//! newest one has any value.
 //!
-//! ## Why the dialog only appears once
-//!
-//! `select_sources` is handed a saved *restore token* (see
-//! `token_store.rs`) and `PersistMode::ExplicitlyRevoked`, so the
-//! compositor restores the previous screen selection silently instead of
-//! prompting. `start()`'s reply carries a fresh token which we immediately
-//! save, because using a token consumes it.
+//! `select_sources` is handed a saved restore token (`token_store.rs`)
+//! with `PersistMode::ExplicitlyRevoked`, so the compositor restores the
+//! previous screen selection silently instead of prompting on every run.
 
 use crate::token_store;
 use ashpd::desktop::{
@@ -56,67 +39,60 @@ use std::sync::{Arc, Mutex};
 ///
 /// This is the main cost knob for the live feed: every frame is converted
 /// from the compositor's layout (usually BGRx) into a packed `RgbImage` on
-/// the CPU, so the work scales with `framerate * screen area`. 30 keeps the
-/// loupe feeling immediate on a video; drop it if a large display makes the
-/// capture thread too hot.
+/// the CPU, so the work scales with `framerate * screen area`. 30 keeps
+/// the loupe feeling immediate on a video; lower it if a large display
+/// makes the capture thread too hot.
 ///
-/// It is a *maximum*, not a promise — compositors generally only send a
-/// frame when something actually changed, so a static screen costs nothing.
+/// This is a maximum, not a promise: compositors generally only send a
+/// frame when something actually changed, so a static screen costs
+/// nothing.
 const FRAMERATE: u32 = 30;
 
-/// How long [`Capture::open`] waits for the compositor's first frame before
-/// giving up.
+/// How long [`Capture::open`] waits for the compositor's first frame
+/// before giving up.
 ///
-/// This is not about slow machines: by the time we wait here, the portal
-/// round-trip (and the picker dialog, on the runs that show one) is already
-/// done, and a compositor sends the current screen contents as soon as the
-/// stream connects. Several seconds is therefore very generous for the happy
-/// path, and the timeout exists for the paths that would otherwise hang
-/// forever — see [`Capture::no_frame_error`] for what those are.
+/// By the time this wait starts, the portal round-trip (and the picker
+/// dialog, on runs that show one) is already done, and a compositor sends
+/// the current screen contents as soon as the stream connects. Several
+/// seconds is generous for the happy path; the timeout exists for the
+/// paths that would otherwise hang forever — see
+/// [`Capture::no_frame_error`] for what those are.
 const FIRST_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Counters the PipeWire thread bumps as it goes, read only when something
-/// went wrong.
+/// goes wrong, so a failure message can say *which* stage failed instead
+/// of just "no frame arrived" (whose causes range from a genuine
+/// limitation of this module to a sleeping monitor).
 ///
-/// Their whole purpose is to turn "no frame arrived" — which has several
-/// very different causes, one of which is a genuine limitation of this
-/// module — into a message that says which one happened. Without them a
-/// DMA-BUF-only compositor and a sleeping monitor are indistinguishable.
-///
-/// `Relaxed` throughout: these are diagnostics, never used to synchronise
-/// anything. The frame handoff itself goes through the `latest` mutex.
+/// `Relaxed` throughout: these are diagnostics only, never used to
+/// synchronize anything. The frame handoff itself goes through the
+/// `latest` mutex.
 #[derive(Default)]
 struct StreamDiagnostics {
     /// `param_changed` successfully parsed a video format.
     format_negotiated: AtomicBool,
     /// Buffers successfully dequeued from the stream.
     buffers_dequeued: AtomicU32,
-    /// Buffers whose plane had no CPU-readable data. This is the DMA-BUF
-    /// signature: the compositor handed us GPU memory, which this module
-    /// deliberately does not import.
+    /// Buffers whose plane had no CPU-readable data — the DMA-BUF
+    /// signature: the compositor handed over GPU memory, which this
+    /// module deliberately does not import.
     planes_unmapped: AtomicU32,
     /// Buffers that made it all the way to an `RgbImage`.
     frames_decoded: AtomicU32,
 }
 
 /// Remembers, for this process only, that the user declined the
-/// screen-share prompt.
+/// screen-share prompt, so later picks fall back to `Screenshot` directly
+/// instead of re-prompting someone who already said no.
 ///
-/// Without it, every single pick would re-prompt someone who has already
-/// said no — which is both annoying and the kind of nagging that trains
-/// people to click through permission dialogs without reading them.
-///
-/// Deliberately *not* persisted to disk, unlike the restore token. A
-/// remembered "no" with no visible way to take it back is a trap: the user
-/// would have to know a config file exists to ever get the live magnifier
-/// again. Restarting the app is a discoverable reset; a stale file on disk
-/// is not.
+/// Deliberately not persisted to disk, unlike the restore token: a
+/// remembered "no" with no visible way to undo it would trap the user into
+/// never seeing the live magnifier again without knowing a config file
+/// exists. Restarting the app is a discoverable reset; a stale file on
+/// disk is not.
 static SCREENCAST_DECLINED: AtomicBool = AtomicBool::new(false);
 
-/// Where the magnifier's pixels come from. Two speeds, as it were.
-///
-/// The variants differ in more than liveness, and callers showing a
-/// magnifier should be aware of both differences:
+/// Where the magnifier's pixels come from.
 ///
 /// | | [`Self::Live`] | [`Self::Still`] |
 /// |---|---|---|
@@ -134,9 +110,9 @@ pub enum ScreenSource {
 impl ScreenSource {
     /// The newest frame, if one has arrived since the last call.
     ///
-    /// Always `None` for [`Self::Still`] — there is no second frame — which
-    /// is exactly what a caller doing `if let Some(f) = source.take_frame()`
-    /// needs: it simply keeps displaying the image it already has.
+    /// Always `None` for [`Self::Still`], which is exactly what a caller
+    /// doing `if let Some(f) = source.take_frame()` needs: it simply keeps
+    /// displaying the image it already has.
     pub fn take_frame(&self) -> Option<RgbImage> {
         match self {
             Self::Live(capture) => capture.take_frame(),
@@ -155,15 +131,14 @@ impl ScreenSource {
 /// declines the screen-share prompt.
 ///
 /// Order of attempts:
-///
-/// 1. `ScreenCast` — live feed, cursor hidden. Skipped outright if the user
-///    already declined once this run (see [`SCREENCAST_DECLINED`]).
+/// 1. `ScreenCast` — live feed, cursor hidden. Skipped outright if the
+///    user already declined once this run.
 /// 2. `Screenshot` — a still frame, cursor included.
 ///
-/// Only an explicit *refusal* triggers the fallback. Every other failure
-/// propagates, on purpose: silently degrading on a technical error would
-/// throw away the diagnostics `Capture::no_frame_error` works to produce,
-/// and would turn "DMA-BUF is unsupported on this compositor" into the much
+/// Only an explicit refusal triggers the fallback; every other failure
+/// propagates. Silently degrading on a technical error would throw away
+/// the diagnostics `Capture::no_frame_error` produces, turning something
+/// like "DMA-BUF is unsupported on this compositor" into the much
 /// harder-to-chase "the magnifier is mysteriously never live".
 pub async fn open_best() -> anyhow::Result<(ScreenSource, RgbImage)> {
     if !SCREENCAST_DECLINED.load(Ordering::Relaxed) {
@@ -190,13 +165,9 @@ pub async fn open_best() -> anyhow::Result<(ScreenSource, RgbImage)> {
 ///
 /// The portal reports a declined request as a normal response carrying
 /// `ResponseType::Cancelled`, which ashpd surfaces as
-/// `Error::Response(ResponseError::Cancelled)`. Because our errors travel as
-/// `anyhow::Error`, recovering that requires a downcast — which works here
-/// only because `ashpd::Error` implements `std::error::Error`.
-///
-/// Note this also matches the user dismissing the dialog with Escape rather
-/// than clicking a "deny" button; the portal makes no distinction, and
-/// neither should we.
+/// `Error::Response(ResponseError::Cancelled)`. This also matches the user
+/// dismissing the dialog with Escape rather than clicking a "deny" button;
+/// the portal makes no distinction, and neither does this function.
 fn is_user_refusal(err: &anyhow::Error) -> bool {
     matches!(
         err.downcast_ref::<ashpd::Error>(),
@@ -232,58 +203,47 @@ impl Capture {
     /// Opens a ScreenCast session with the cursor hidden and waits for the
     /// first frame.
     ///
-    /// Returns the live handle plus that first frame, so a caller can put a
-    /// magnifier on screen with something to show immediately rather than
-    /// flashing an empty overlay while negotiation finishes.
+    /// Returns the live handle plus that first frame, so a caller can put
+    /// a magnifier on screen with something to show immediately rather
+    /// than flashing an empty overlay while negotiation finishes.
     ///
     /// Must be awaited on `runtime::shared()`: ashpd's cached D-Bus
-    /// connection binds to the first runtime it sees, so a per-call runtime
-    /// breaks every call after the first (see runtime.rs).
+    /// connection binds to the first runtime it sees (see runtime.rs).
     pub async fn open() -> anyhow::Result<(Self, RgbImage)> {
-        // Annotated `'static` so the resulting `Session` is `'static` too
-        // and can live in the struct below. Sound because ashpd's proxies
-        // borrow from its process-wide cached connection, not from
-        // anything local.
         let proxy: Screencast<'static> = Screencast::new().await?;
         let session = proxy.create_session().await?;
 
-        // ashpd 0.9 exposes `SelectSourcesOptions` only internally; the
-        // public API is this flat argument list which it assembles into
-        // those options for us.
         proxy
             .select_sources(
                 &session,
                 CursorMode::Hidden,
                 SourceType::Monitor.into(),
-                // We only ever want one output; asking for multiple just
-                // adds a "select all the ones you want" step to the
-                // picker dialog for no benefit to us.
+                // Only ever one output: asking for multiple just adds a
+                // "select all the ones you want" step to the picker dialog
+                // for no benefit here.
                 false,
-                // The saved token and `ExplicitlyRevoked` are what suppress
-                // the picker dialog on later runs. `Application` would not
-                // do: that persists only for the lifetime of the running
-                // app, so it would still prompt once per launch.
+                // The saved token plus `ExplicitlyRevoked` are what
+                // suppress the picker dialog on later runs. `Application`
+                // would only persist for the running process, so it would
+                // still prompt once per launch.
                 token_store::load().as_deref(),
                 PersistMode::ExplicitlyRevoked,
             )
             .await?
             .response()?;
 
-        // `WindowIdentifier::default()` is the `None` variant — we have no
-        // toplevel handle to give the portal, so the dialog (on the runs
-        // where it does appear) isn't parented to our window. Exporting a
-        // real handle would need ashpd's `wayland`/`gtk4` features and
-        // access to eframe's surface, and the `magnify` subcommand has no
-        // window at all.
+        // `WindowIdentifier::default()` (the `None` variant) means the
+        // dialog, on runs where it appears, isn't parented to our window —
+        // exporting a real handle would need ashpd's wayland/gtk4 features
+        // and access to eframe's surface.
         let response = proxy
             .start(&session, &WindowIdentifier::default())
             .await?
             .response()?;
 
-        // Saved before anything else can fail: this token is what spares
-        // the user the dialog next time, and each successful `start()`
-        // invalidates the token we sent, so skipping the re-save is what
-        // would make the dialog reappear on every second run.
+        // Saved immediately: each successful `start()` invalidates the
+        // token that was sent, so skipping this re-save is what would make
+        // the dialog reappear on every second run.
         if let Some(token) = response.restore_token() {
             token_store::store(token);
         }
@@ -294,11 +254,6 @@ impl Capture {
             .ok_or_else(|| anyhow::anyhow!("compositor returned no screencast streams"))?;
         let node_id = stream.pipe_wire_node_id();
 
-        // Takes only the session: unlike Camera's version, a Screencast
-        // portal can have several concurrent sessions, so it has to know
-        // which one's remote to hand back. There's no options argument —
-        // ashpd passes an empty dict because xdg-desktop-portal ignores it
-        // for this method.
         let pw_fd = proxy.open_pipe_wire_remote(&session).await?;
 
         let latest: Arc<Mutex<Option<RgbImage>>> = Arc::new(Mutex::new(None));
@@ -343,11 +298,9 @@ impl Capture {
                 }
             })?;
 
-        // Assembled *before* waiting for the first frame, so that every
-        // error path below is a plain `return` and still stops the thread
-        // and closes the portal session — `Drop` does it. Duplicating that
-        // teardown on each failure branch is how one of them ends up
-        // forgetting it.
+        // Assembled before waiting for the first frame, so every error
+        // path below is a plain `return` and `Drop` still stops the thread
+        // and closes the portal session.
         let capture = Self {
             latest,
             stop,
@@ -364,10 +317,9 @@ impl Capture {
             Ok(Err(_)) => {
                 anyhow::bail!("the screencast thread stopped before producing a frame")
             }
-            // The reason this timeout exists at all: the stream is alive and
-            // reported no error, but no frame ever landed. Before this
-            // branch existed the `await` simply never returned and the app
-            // hung with nothing on stderr.
+            // The stream is alive and reported no error, but no frame ever
+            // landed — without this timeout the await would simply never
+            // return.
             Err(_elapsed) => return Err(capture.no_frame_error()),
         }
 
@@ -380,12 +332,9 @@ impl Capture {
 
     /// Builds the error for "waited [`FIRST_FRAME_TIMEOUT`] and got no
     /// frame", naming the most likely cause from what the stream thread
-    /// actually observed.
-    ///
-    /// Worth the trouble because the causes are genuinely different
-    /// problems for whoever reads the message — one is a limitation of this
-    /// code, one is the screen being off, one is a broken connection — and
-    /// they are indistinguishable from the outside.
+    /// observed — worth doing because the causes are genuinely different
+    /// problems (a limitation of this code, the screen being off, a broken
+    /// connection) that are otherwise indistinguishable from the outside.
     fn no_frame_error(&self) -> anyhow::Error {
         let d = &self.diagnostics;
         let dequeued = d.buffers_dequeued.load(Ordering::Relaxed);
@@ -423,10 +372,10 @@ impl Capture {
 
     /// Takes the newest frame, if one has arrived since the last call.
     ///
-    /// `None` means "nothing new" — the caller should keep displaying what
+    /// `None` means nothing new — the caller should keep displaying what
     /// it already has, which is why this is cheap to call every repaint.
-    /// The image is moved out of the slot rather than copied, so this costs
-    /// a mutex lock and a pointer move regardless of resolution.
+    /// The image is moved out of the slot rather than copied, so this
+    /// costs a mutex lock and a pointer move regardless of resolution.
     pub fn take_frame(&self) -> Option<RgbImage> {
         self.latest
             .lock()
@@ -438,8 +387,8 @@ impl Capture {
 impl Drop for Capture {
     fn drop(&mut self) {
         // Wakes the mainloop out of `run()` so the thread can unwind. An
-        // error here means the receiver is already gone (thread died on its
-        // own), in which case the join below returns immediately.
+        // error here means the receiver is already gone (thread died on
+        // its own), in which case the join below returns immediately.
         let _ = self.stop.send(());
 
         if let Some(thread) = self.thread.take() {
@@ -447,9 +396,8 @@ impl Drop for Capture {
         }
 
         // ashpd's `Session` has no `Drop` of its own, so an unclosed
-        // session lingers server-side until the process exits. That is
-        // survivable for the CLI but not for the GUI, which opens a session
-        // per pick and would pile them up.
+        // session lingers server-side until the process exits — survivable
+        // for the CLI but not for the GUI, which opens a session per pick.
         //
         // Spawned rather than `block_on`: `Drop` runs on the UI thread and
         // must not park it on a D-Bus round-trip, and `block_on` from
@@ -511,8 +459,8 @@ fn run_stream(
 
     // Guarded because `open()` may be called many times over a GUI
     // session, each on a fresh thread. `pw_init` is documented as
-    // refcounted rather than strictly idempotent, and we never call the
-    // matching `pw_deinit`, so calling it once per process is both
+    // refcounted rather than strictly idempotent, and the matching
+    // `pw_deinit` is never called, so calling it once per process is both
     // sufficient and the only shape that stays balanced.
     static PW_INIT: std::sync::Once = std::sync::Once::new();
     PW_INIT.call_once(pipewire::init);
@@ -520,14 +468,14 @@ fn run_stream(
     let mainloop = MainLoopRc::new(None)?;
     let context = ContextRc::new(&mainloop, None)?;
     // `connect_fd_rc` (rather than `connect_rc`, which would talk to the
-    // user's *default* PipeWire socket) is what makes this use the
+    // user's default PipeWire socket) is what makes this use the
     // portal-brokered, capture-scoped remote. `_rc` because `StreamBox`
-    // needs a `Core` that outlives the borrow, which the plain `connect_fd`
-    // does not give.
+    // needs a `Core` that outlives the borrow, which the plain
+    // `connect_fd` does not give.
     let core = context.connect_fd_rc(pw_fd, None)?;
 
     // Plain `Rc<RefCell<..>>` for the negotiated format: it is written by
-    // `param_changed` and read by `process`, both of which run on this one
+    // `param_changed` and read by `process`, both running on this one
     // thread, driven synchronously by `mainloop.run()`. Only `latest`
     // crosses a thread boundary, and that one is an `Arc<Mutex<..>>`.
     let format: Rc<RefCell<VideoInfoRaw>> = Rc::new(RefCell::new(Default::default()));
@@ -547,10 +495,10 @@ fn run_stream(
     let diag_for_process = Arc::clone(&diagnostics);
     let diag_for_param_changed = Arc::clone(&diagnostics);
 
-    // `::<()>` because this listener carries no PipeWire-managed user data
-    // — the state the callbacks need is captured by the closures instead.
-    // Without the turbofish `D` is unconstrained, since neither closure
-    // reads its user-data argument.
+    // `::<()>` because this listener carries no PipeWire-managed user
+    // data — the state the callbacks need is captured by the closures
+    // instead. Without the turbofish, `D` is unconstrained since neither
+    // closure reads its user-data argument.
     let _listener = stream
         .add_local_listener::<()>()
         .param_changed(move |_stream, _user_data, id, param| {
@@ -584,20 +532,20 @@ fn run_stream(
                 return;
             };
 
-            // Read before `plane.data()`: that borrows the plane mutably for
-            // as long as the returned slice lives, so `plane.chunk()` is no
-            // longer reachable afterwards.
+            // Read before `plane.data()`: that borrows the plane mutably
+            // for as long as the returned slice lives, so `plane.chunk()`
+            // is no longer reachable afterwards.
             //
-            // `stride` can exceed `width * bytes_per_pixel` (rows padded for
-            // alignment), which is why the conversion walks row by row using
-            // this rather than assuming a tightly packed buffer.
+            // `stride` can exceed `width * bytes_per_pixel` (rows padded
+            // for alignment), which is why the conversion walks row by row
+            // using this rather than assuming a tightly packed buffer.
             let stride = plane.chunk().stride() as usize;
 
-            // `None` here is the DMA-BUF case: the buffer holds a GPU handle
-            // rather than mappable memory. Counted rather than just skipped,
-            // because it is the one failure mode that means "unsupported"
-            // instead of "try again", and `no_frame_error` reports it as
-            // such.
+            // `None` here is the DMA-BUF case: the buffer holds a GPU
+            // handle rather than mappable memory. Counted rather than just
+            // skipped, since it's the one failure mode that means
+            // "unsupported" instead of "try again", and `no_frame_error`
+            // reports it as such.
             let Some(chunk_data) = plane.data() else {
                 diag_for_process
                     .planes_unmapped
@@ -609,8 +557,9 @@ fn run_stream(
             let (width, height) = (info.size().width, info.size().height);
             if width == 0 || height == 0 {
                 // Format not negotiated yet — shouldn't happen, since
-                // `param_changed` fires before the first `process`, but bail
-                // rather than build a zero-sized image if it ever does.
+                // `param_changed` fires before the first `process`, but
+                // bail rather than build a zero-sized image if it ever
+                // does.
                 return;
             }
 
@@ -622,8 +571,9 @@ fn run_stream(
                 .fetch_add(1, Ordering::Relaxed);
 
             // Overwrites whatever the consumer hasn't taken yet: only the
-            // newest frame is worth anything, and this is what keeps a slow
-            // repaint loop from building a backlog of full-screen images.
+            // newest frame is worth anything, and this is what keeps a
+            // slow repaint loop from building a backlog of full-screen
+            // images.
             *latest
                 .lock()
                 .expect("frame slot mutex poisoned by the ui thread") = Some(img);
@@ -637,10 +587,9 @@ fn run_stream(
         .register()?;
 
     // Only formats with a trivial byte-order mapping to `image::Rgb` are
-    // offered — no YUY2/I420 as the upstream `streams.rs` example does,
-    // since a YUV->RGB path would be untestable guesswork here and this app
-    // only ever reads pixel colors back out. GNOME/mutter normally picks
-    // BGRx from this list.
+    // offered — no YUY2/I420, since a YUV->RGB path would be untestable
+    // guesswork here and this app only ever reads pixel colors back out.
+    // GNOME/mutter normally picks BGRx from this list.
     let obj = spa::pod::object!(
         SpaTypes::ObjectParamFormat,
         ParamType::EnumFormat,
@@ -692,13 +641,13 @@ fn run_stream(
         &mut params,
     )?;
 
-    // Attached *after* `connect` but before `run`, and kept in scope for
-    // the whole loop — dropping an `AttachedReceiver` detaches it, which
-    // would make the stop signal a no-op and hang this thread forever.
+    // Attached after `connect` but before `run`, and kept in scope for the
+    // whole loop — dropping an `AttachedReceiver` detaches it, which would
+    // make the stop signal a no-op and hang this thread forever.
     //
-    // A weak handle in the callback, because the callback is owned by an io
-    // source owned by the loop: capturing a strong `MainLoopRc` would make
-    // the loop keep itself alive.
+    // A weak handle in the callback, because the callback is owned by an
+    // io source owned by the loop: capturing a strong `MainLoopRc` would
+    // make the loop keep itself alive.
     let weak_loop = mainloop.downgrade();
     let _stop_receiver = stop_rx.attach(mainloop.loop_(), move |()| {
         if let Some(mainloop) = weak_loop.upgrade() {
@@ -716,12 +665,10 @@ fn run_stream(
 
 /// Repacks one PipeWire buffer into a tightly packed `RgbImage`.
 ///
-/// Deliberately not `put_pixel` in a nested loop, which is what the
-/// one-shot version of this module did: that pays a bounds check and a
-/// function call per pixel, which is invisible for a single snapshot and
-/// very much not for a 30fps full-screen feed. Building the backing `Vec`
-/// directly and handing it to `from_raw` keeps the per-frame cost to one
-/// pass over the source.
+/// Builds the backing `Vec` directly and hands it to `from_raw` in one
+/// pass over the source, rather than a `put_pixel` loop that would pay a
+/// bounds check and function call per pixel — invisible for a single
+/// snapshot but not for a 30fps full-screen feed.
 ///
 /// Returns `None` for an unsupported format or a short/truncated buffer,
 /// which the caller treats as "skip this frame".
@@ -766,22 +713,9 @@ fn frame_to_rgb(
     RgbImage::from_raw(width, height, out)
 }
 
-// ── UX note: ScreenCast vs Screenshot ──────────────────────────────────
-//
-// `Screenshot::interactive(false)` (the code this replaced) skipped any
-// compositor dialog entirely and grabbed the screen immediately on click.
-//
-// `ScreenCast` is a *session-based* portal: `start()` normally opens the
-// compositor's screen-share picker and blocks until the user confirms.
-// That is the price of `cursor_mode: Hidden`, which only ScreenCast
-// exposes — and it is why the restore-token handling in `open()` matters
-// so much here. With a saved token the dialog appears on the very first
-// run and then not again; without one it would appear on every single
-// pick.
-//
-// If the user ever wants to reset that grant, it lives in the
+// If the user wants to reset the ScreenCast grant, it lives in the
 // compositor's own privacy settings (GNOME: Settings -> Privacy -> Screen
 // Sharing), plus `token_store.rs`'s file. Revoking on the compositor side
 // while our token file remains just means the next `select_sources` sends
-// a stale token, which the portal ignores in favour of prompting — and
-// then we save the new token. No cleanup needed on our side.
+// a stale token, which the portal ignores in favor of prompting — and then
+// the new token gets saved. No cleanup needed on our side.

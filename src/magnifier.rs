@@ -1,22 +1,11 @@
-//! Fullscreen magnifier overlay — a Rust/egui port of the old PyQt6
-//! `PickerOverlay` in `picker.py`.
+//! Fullscreen magnifier overlay.
 //!
-//! Same trick as `picker.py` and `shmooz`: the window covers the whole
-//! screen and tracks the mouse *inside itself*, so we get "global" cursor
-//! following without evdev or any special permissions. The only different
-//! piece is where the screen image comes from (`screencast::ScreenSource`
-//! instead of shelling out to `spectacle`/`grim`) — normally a live
-//! PipeWire feed, so the sampled color tracks a playing video under the
-//! loupe, and a single still screenshot when the user declined screen
-//! sharing.
-//!
-//! Correspondence with `picker.py`:
-//! - `PickerOverlay.__init__`            -> `MagnifierApp::new`
-//! - `PickerOverlay.paintEvent`          -> `MagnifierApp::draw_magnifier`
-//! - `PickerOverlay.mouseMoveEvent`      -> read from `ctx.input(|i| i.pointer...)`
-//! - `PickerOverlay.mousePressEvent`     -> same, checking `pointer.primary_clicked()`
-//! - `PickerOverlay.keyPressEvent` (Esc) -> `ctx.input(|i| i.key_pressed(egui::Key::Escape))`
-//! - `launch_picker` / `_pick`           -> `MagnifierApp::run`, returns `Option<Rgb>`
+//! The window covers the whole screen and tracks the mouse inside itself,
+//! which gives "global" cursor following without evdev or any special
+//! permissions. The screen image comes from `screencast::ScreenSource`:
+//! normally a live PipeWire feed, so the sampled color tracks a playing
+//! video under the loupe, and a single still screenshot when the user
+//! declined screen sharing.
 
 use eframe::egui;
 use image::RgbImage;
@@ -24,11 +13,9 @@ use image::RgbImage;
 use crate::color::Rgb;
 
 /// Pixels sampled per side of the magnifier grid (odd, so there is a
-/// well-defined center cell under the cursor). Matches `LOUPE_PX` in
-/// `picker.py`.
+/// well-defined center cell under the cursor).
 const LOUPE_PX: usize = 9;
-/// On-screen size in points of the whole magnifier square. Matches
-/// `LOUPE_SIZE` in `picker.py`.
+/// On-screen size in points of the whole magnifier square.
 const LOUPE_SIZE: f32 = 180.0;
 const CELL: f32 = LOUPE_SIZE / LOUPE_PX as f32;
 const HEX_BAND_HEIGHT: f32 = 28.0;
@@ -41,11 +28,11 @@ const LOUPE_OFFSET: f32 = 20.0;
 /// (left click / Enter) or cancels (Escape / closes the window).
 ///
 /// `first_frame` is the image the loupe shows immediately, and `capture` is
-/// the live session it keeps pulling newer frames from — so parking the
-/// loupe on a playing video tracks the video rather than freezing on the
-/// frame that happened to be on screen when the overlay opened. `capture`
-/// is dropped when this returns, which stops the stream and closes the
-/// portal session.
+/// the live session it keeps pulling newer frames from, so parking the
+/// loupe on a playing video tracks the video rather than freezing on
+/// whatever was on screen when the overlay opened. `capture` is dropped
+/// when this returns, which stops the stream and closes the portal
+/// session.
 pub fn run(
     first_frame: RgbImage,
     capture: crate::screencast::ScreenSource,
@@ -60,56 +47,49 @@ pub fn run(
     };
 
     // eframe owns the event loop and only returns once the window closes,
-    // so we can't just return a value from inside the App; a channel is
-    // the idiomatic way to hand a result back out. The sender is cloned
-    // into the App and fired exactly once, right before the app requests
-    // the window to close.
+    // so a channel is how the picked color gets handed back out. The
+    // sender is fired at most once, right before the app requests the
+    // window to close.
     let (tx, rx) = std::sync::mpsc::channel::<Rgb>();
     let app = MagnifierApp::new(first_frame, capture, tx);
 
     eframe::run_native(
-        "colorpick magnifier",
+        "colza magnifier",
         options,
         Box::new(move |_cc| Ok(Box::new(app))),
     )
     .map_err(|err| anyhow::anyhow!("eframe failed: {err}"))?;
 
     // By the time run_native returns, the app has either sent exactly one
-    // color (picked) or dropped the sender without sending (cancelled),
-    // so a non-blocking try_recv is enough here.
+    // color (picked) or dropped the sender without sending (cancelled), so
+    // a non-blocking try_recv is enough here.
     Ok(rx.try_recv().ok())
 }
 
 /// Everything the magnifier needs to sample colors from the captured
 /// screenshot and map window-space points to image pixels. This is the
 /// reusable core: both the standalone `MagnifierApp` (CLI `magnify`
-/// subcommand, own eframe event loop) and an embedding app (e.g. a
-/// "pick" mode inside a bigger eframe window) can hold one of these and
-/// call `draw` / `handle_input` directly from their own `update()`.
+/// subcommand, own eframe event loop) and the embedding `app::App` (a
+/// "pick" mode inside the main window) hold one of these and call
+/// `draw`/`handle_input` directly from their own `update()`.
 ///
-/// This type deliberately knows nothing about PipeWire: to drive a live
-/// view, the owner assigns a newer image to `screenshot` between frames
-/// (both callers do this from `Capture::take_frame()`). Sampling reads
-/// straight out of that `RgbImage` on the CPU — no GPU texture upload — so
-/// replacing it per frame costs only the move.
+/// This type knows nothing about PipeWire: to drive a live view, the owner
+/// assigns a newer image to `screenshot` between frames (both callers do
+/// this from `Capture::take_frame()`). Sampling reads straight out of that
+/// `RgbImage` on the CPU, so replacing it per frame costs only the move.
 pub struct MagnifierState {
     /// The image being sampled. Public so an owner driving a live feed can
-    /// swap in a newer frame; a plain assignment is enough.
+    /// swap in a newer frame with a plain assignment.
     pub screenshot: RgbImage,
     pub cursor_pos: egui::Pos2,
     /// Whether `screenshot` is being refreshed. `false` draws a small
-    /// caption under the loupe.
-    ///
-    /// Worth surfacing because the degraded path differs in two ways the
-    /// user would otherwise just find puzzling: the image never updates,
-    /// and the mouse cursor is baked into it (`Screenshot` gives no way to
-    /// hide it). Without a label, that reads as a bug rather than a
-    /// consequence of having declined screen sharing.
+    /// caption under the loupe, since the degraded path differs in two
+    /// ways that would otherwise look like a bug: the image never updates,
+    /// and the mouse cursor is baked into it.
     pub live: bool,
 }
 
 impl MagnifierState {
-    /// A magnifier over a feed that keeps updating.
     pub fn new(screenshot: RgbImage) -> Self {
         Self {
             screenshot,
@@ -125,10 +105,9 @@ impl MagnifierState {
         Rgb::new(px[0], px[1], px[2])
     }
 
-    /// Maps a point in *window/logical* space to a pixel in the captured
+    /// Maps a point in window/logical space to a pixel in the captured
     /// screenshot, accounting for the screenshot possibly being a
-    /// different resolution than the logical window size (HiDPI), the
-    /// same role `self.dpr` plays in `picker.py`.
+    /// different resolution than the logical window size (HiDPI).
     pub fn image_pos_for(&self, ctx: &egui::Context, logical: egui::Pos2) -> (u32, u32) {
         let screen_rect = ctx.screen_rect();
         let scale_x = self.screenshot.width() as f32 / screen_rect.width().max(1.0);
@@ -140,34 +119,31 @@ impl MagnifierState {
     }
 
     /// Reads pointer/keyboard input for this frame: updates `cursor_pos`
-    /// (including arrow-key nudging, like `PickerOverlay.keyPressEvent`),
-    /// and reports whether the user picked (click/Enter) or cancelled
-    /// (Esc) this frame. Does not draw anything and does not close any
-    /// window — the caller decides what "picked"/"cancelled" means.
+    /// (including arrow-key nudging), and reports whether the user picked
+    /// (click/Enter) or cancelled (Esc) this frame. Does not draw anything
+    /// and does not close any window — the caller decides what
+    /// picked/cancelled means.
     pub fn handle_input(&mut self, ctx: &egui::Context) -> MagnifierInput {
         let mut clicked_or_entered = false;
         let mut cancelled = false;
 
-        // IMPORTANT: `ctx.input(...)` holds an internal lock on egui's
-        // input state for the duration of the closure. Calling anything
-        // that itself needs to lock `ctx` (like `ctx.screen_rect()`, which
-        // `image_pos_for` calls) from *inside* this closure re-enters that
-        // lock and deadlocks — this was the freeze-on-click bug. So this
-        // closure only reads `input` and sets plain local flags; anything
-        // that needs `ctx` again happens after the closure returns.
+        // `ctx.input(...)` holds an internal lock on egui's input state for
+        // the duration of the closure. Calling anything that itself needs
+        // to lock `ctx` (like `ctx.screen_rect()`, which `image_pos_for`
+        // calls) from inside this closure would re-enter that lock and
+        // deadlock. So this closure only reads `input` and sets plain
+        // local flags; anything needing `ctx` again happens after it
+        // returns.
         ctx.input(|input| {
             // Only snap `cursor_pos` to the physical mouse position when
-            // the mouse actually moved *this frame* (or on the very first
-            // frame, when we haven't seen a pointer position yet). egui
-            // redraws continuously while this viewport is open, and
-            // `pointer.latest_pos()` returns the mouse's current position
-            // on every single frame regardless of whether it moved — so
-            // unconditionally assigning it here (as a previous version of
-            // this function did) overwrote arrow-key nudges one frame
-            // after they were applied, which looked like the loupe
-            // flashing in place instead of moving. `pointer.delta()` is
-            // egui's per-frame movement vector and is exactly zero when
-            // the mouse hasn't moved, so it's the right signal to gate on.
+            // the mouse actually moved this frame (or on the very first
+            // frame). egui redraws continuously while this viewport is
+            // open, and `pointer.latest_pos()` returns the mouse's current
+            // position every frame regardless of movement, so
+            // unconditionally assigning it would overwrite arrow-key
+            // nudges the frame after they're applied. `pointer.delta()` is
+            // exactly zero when the mouse hasn't moved, so it's the right
+            // signal to gate on.
             let mouse_moved = input.pointer.delta() != egui::Vec2::ZERO;
             if mouse_moved || self.cursor_pos == egui::Pos2::ZERO {
                 if let Some(pos) = input.pointer.latest_pos() {
@@ -175,8 +151,7 @@ impl MagnifierState {
                 }
             }
 
-            // Arrow keys nudge the cursor by one logical pixel, mirroring
-            // `PickerOverlay.keyPressEvent`'s Left/Right/Up/Down handling.
+            // Arrow keys nudge the cursor by one logical pixel.
             let mut delta = egui::Vec2::ZERO;
             if input.key_pressed(egui::Key::ArrowLeft) {
                 delta.x -= 1.0;
@@ -212,7 +187,6 @@ impl MagnifierState {
         MagnifierInput { picked, cancelled }
     }
 
-    /// Direct port of `PickerOverlay.paintEvent`.
     pub fn draw(&self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let painter = ui.painter();
         let screen_rect = ctx.screen_rect();
@@ -221,15 +195,15 @@ impl MagnifierState {
         let half = (LOUPE_PX / 2) as i64;
 
         // Flip the loupe to the opposite side of the cursor if it would
-        // otherwise run off the screen — same logic as picker.py's
-        // `lx`/`ly` adjustment.
+        // otherwise run off the screen.
         let mut loupe_origin = egui::pos2(cursor.x + LOUPE_OFFSET, cursor.y + LOUPE_OFFSET);
         if loupe_origin.x + LOUPE_SIZE > screen_rect.width() {
             loupe_origin.x = cursor.x - LOUPE_SIZE - LOUPE_OFFSET;
         }
-        // Everything drawn below the grid, which the flip has to account for
-        // or the bottom-most element lands off-screen near the lower edge.
-        // The still-mode caption is part of that stack when present.
+        // Everything drawn below the grid, which the flip above must
+        // account for or the bottom-most element lands off-screen near the
+        // lower edge. The still-mode caption is part of that stack when
+        // present.
         let below_grid = HEX_BAND_HEIGHT
             + 2.0
             + if self.live {
@@ -314,9 +288,9 @@ impl MagnifierState {
         );
 
         if !self.live {
-            // Drawn with its own dark backing rather than straight onto the
-            // screen: this sits on top of arbitrary desktop content, and
-            // plain text over an unknown background is a coin flip for
+            // Drawn with its own dark backing rather than straight onto
+            // the screen: this sits on top of arbitrary desktop content,
+            // and plain text over an unknown background is a coin flip for
             // legibility.
             let caption = "still image · cursor shown";
             let caption_rect = egui::Rect::from_min_size(
@@ -340,24 +314,20 @@ impl MagnifierState {
 }
 
 /// Result of `MagnifierState::handle_input` for one frame: at most one of
-/// these will be set (a click/Enter picks, Esc cancels; both can't happen
-/// the same frame since Esc short-circuits nothing else here but callers
-/// should just check `picked` first).
+/// these is set (a click/Enter picks, Esc cancels).
 pub struct MagnifierInput {
     pub picked: Option<Rgb>,
     pub cancelled: bool,
 }
 
-/// Standalone eframe app wrapping a `MagnifierState`. Used by the CLI
-/// `magnify` subcommand, which owns its own window/event loop via
-/// `run()`. An app that wants to embed the magnifier as a *mode* inside
-/// a bigger window (e.g. a "pick" button in a larger UI) should hold a
-/// `MagnifierState` directly instead and call `handle_input`/`draw` from
-/// its own `update()` — see `MagnifierState`'s doc comment.
+/// Standalone eframe app wrapping a `MagnifierState`, used by the CLI
+/// `magnify` subcommand, which owns its own window/event loop via `run()`.
+/// An app embedding the magnifier as a mode inside a bigger window (see
+/// `app::App`) holds a `MagnifierState` directly instead and calls
+/// `handle_input`/`draw` from its own `update()`.
 struct MagnifierApp {
     state: MagnifierState,
-    /// Held for the lifetime of the overlay so the feed stays live; see
-    /// `run`'s doc comment.
+    /// Held for the lifetime of the overlay so the feed stays live.
     capture: crate::screencast::ScreenSource,
     result_tx: std::sync::mpsc::Sender<Rgb>,
 }
@@ -380,9 +350,9 @@ impl MagnifierApp {
 
 impl eframe::App for MagnifierApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Swap in the newest frame before reading input, so a click samples
-        // the image the user is actually looking at. `None` means nothing
-        // new since the last repaint — keep showing what we have.
+        // Swap in the newest frame before reading input, so a click
+        // samples the image the user is actually looking at. `None` means
+        // nothing new since the last repaint — keep showing what we have.
         if let Some(frame) = self.capture.take_frame() {
             self.state.screenshot = frame;
         }
@@ -404,16 +374,14 @@ impl eframe::App for MagnifierApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else {
             // Repaint continuously so the magnifier follows the mouse
-            // smoothly even without new input events arriving (egui
-            // defaults to reactive/on-demand painting).
+            // smoothly even without new input events arriving.
             ctx.request_repaint();
         }
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // Fully transparent clear so `with_transparent(true)` actually
-        // shows through anywhere we don't paint, matching
-        // WA_TranslucentBackground in picker.py.
+        // shows through anywhere we don't paint.
         [0.0, 0.0, 0.0, 0.0]
     }
 }

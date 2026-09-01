@@ -1,33 +1,21 @@
 [package]
-name = "colorpick"
+name = "colza"
 version = "0.1.0"
 edition = "2021"
-description = "Minimal CLI: pick a color from the screen via xdg-desktop-portal (GNOME/KDE compatible), compare two colors, check WCAG contrast."
+description = "Color picker and WCAG contrast checker for Wayland (GNOME/KDE) via xdg-desktop-portal"
 license = "MIT"
 
 [dependencies]
-# On ashpd 0.9 there is no per-portal feature split (that landed in the
-# 0.13 line) — every portal module, `desktop::screencast` included, is
-# always compiled. What the features pick is the async backend, and
-# `default` means `async-std`, which ashpd refuses to combine with
-# `tokio`:
-#   error: You can't enable both async-std & tokio features at once
-# Hence `default-features = false`. We want the tokio backend because
-# main.rs drives every portal call from a tokio runtime; leaving ashpd on
-# async-std would spin up a second, independent async-io reactor thread
-# alongside it.
+# ashpd 0.9 has no per-portal feature split (that came in 0.13), so every
+# portal module is always compiled; `default-features = false` only picks
+# the async backend. We need "tokio" since main.rs drives portal calls from
+# a tokio runtime, and ashpd refuses to combine "tokio" with the default
+# "async-std" backend.
 #
-# Do NOT add ashpd's `pipewire` feature here. It pins `pipewire ^0.8`,
-# whose `pipewire-sys` declares `links = "pipewire-0.3"` — the same links
-# value as the `pipewire-sys` behind our own `pipewire = "0.10"` below.
-# Cargo allows only one crate per links value in a dependency graph, so
-# enabling it fails resolution outright:
-#   package `ashpd` links to the native library `pipewire-0.3`, but it
-#   conflicts with a previous package which links to `pipewire-0.3`
-# We don't need it: the feature only gates `ashpd::Error::Pipewire` and
-# `Camera::pipewire_streams`. `Screencast::open_pipe_wire_remote` is
-# unconditional and hands back a plain `OwnedFd`, which screencast.rs
-# feeds to `pipewire` 0.10 directly.
+# Do NOT add ashpd's "pipewire" feature: it pins pipewire-sys to a links
+# value that conflicts with our own `pipewire` dependency below, and cargo
+# only allows one crate per links value. We don't need it anyway —
+# screencast.rs talks to pipewire 0.10 directly via a plain OwnedFd.
 ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
@@ -37,10 +25,7 @@ egui = "0.29"
 image = { version = "0.25", default-features = false, features = ["png"] }
 url = "2"
 
-# screencast.rs talks to PipeWire directly (mainloop + stream + SPA pod
-# format negotiation), so this is a first-class dependency rather than
-# something we borrow through ashpd. 0.10 is the current line and the one
-# whose `MainLoopRc` / `ContextRc::connect_fd` / `StreamRc` API
-# screencast.rs is written against. Builds against the system
-# libpipewire-0.3 / libspa-0.2 pkg-config files (Arch: `libpipewire`).
+# screencast.rs drives PipeWire directly (mainloop, stream, format
+# negotiation), so this is a first-class dependency. Builds against the
+# system libpipewire-0.3 / libspa-0.2 pkg-config files.
 pipewire = "0.10"
