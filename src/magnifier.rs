@@ -4,10 +4,11 @@
 //! Same trick as `picker.py` and `shmooz`: the window covers the whole
 //! screen and tracks the mouse *inside itself*, so we get "global" cursor
 //! following without evdev or any special permissions. The only different
-//! piece is where the screen image comes from (`screencast::Capture`
-//! instead of shelling out to `spectacle`/`grim`) — and that it is a live
-//! PipeWire feed rather than a still, so the sampled color tracks a playing
-//! video under the loupe.
+//! piece is where the screen image comes from (`screencast::ScreenSource`
+//! instead of shelling out to `spectacle`/`grim`) — normally a live
+//! PipeWire feed, so the sampled color tracks a playing video under the
+//! loupe, and a single still screenshot when the user declined screen
+//! sharing.
 //!
 //! Correspondence with `picker.py`:
 //! - `PickerOverlay.__init__`            -> `MagnifierApp::new`
@@ -31,6 +32,9 @@ const LOUPE_PX: usize = 9;
 const LOUPE_SIZE: f32 = 180.0;
 const CELL: f32 = LOUPE_SIZE / LOUPE_PX as f32;
 const HEX_BAND_HEIGHT: f32 = 28.0;
+/// Height of the "still image" caption drawn under the hex band when the
+/// source isn't live.
+const STILL_CAPTION_HEIGHT: f32 = 14.0;
 const LOUPE_OFFSET: f32 = 20.0;
 
 /// Runs the fullscreen magnifier and blocks until the user picks a color
@@ -44,7 +48,7 @@ const LOUPE_OFFSET: f32 = 20.0;
 /// portal session.
 pub fn run(
     first_frame: RgbImage,
-    capture: crate::screencast::Capture,
+    capture: crate::screencast::ScreenSource,
 ) -> anyhow::Result<Option<Rgb>> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -93,13 +97,24 @@ pub struct MagnifierState {
     /// swap in a newer frame; a plain assignment is enough.
     pub screenshot: RgbImage,
     pub cursor_pos: egui::Pos2,
+    /// Whether `screenshot` is being refreshed. `false` draws a small
+    /// caption under the loupe.
+    ///
+    /// Worth surfacing because the degraded path differs in two ways the
+    /// user would otherwise just find puzzling: the image never updates,
+    /// and the mouse cursor is baked into it (`Screenshot` gives no way to
+    /// hide it). Without a label, that reads as a bug rather than a
+    /// consequence of having declined screen sharing.
+    pub live: bool,
 }
 
 impl MagnifierState {
+    /// A magnifier over a feed that keeps updating.
     pub fn new(screenshot: RgbImage) -> Self {
         Self {
             screenshot,
             cursor_pos: egui::Pos2::ZERO,
+            live: true,
         }
     }
 
@@ -212,8 +227,18 @@ impl MagnifierState {
         if loupe_origin.x + LOUPE_SIZE > screen_rect.width() {
             loupe_origin.x = cursor.x - LOUPE_SIZE - LOUPE_OFFSET;
         }
-        if loupe_origin.y + LOUPE_SIZE + HEX_BAND_HEIGHT + 2.0 > screen_rect.height() {
-            loupe_origin.y = cursor.y - LOUPE_SIZE - LOUPE_OFFSET - HEX_BAND_HEIGHT - 2.0;
+        // Everything drawn below the grid, which the flip has to account for
+        // or the bottom-most element lands off-screen near the lower edge.
+        // The still-mode caption is part of that stack when present.
+        let below_grid = HEX_BAND_HEIGHT
+            + 2.0
+            + if self.live {
+                0.0
+            } else {
+                STILL_CAPTION_HEIGHT + 2.0
+            };
+        if loupe_origin.y + LOUPE_SIZE + below_grid > screen_rect.height() {
+            loupe_origin.y = cursor.y - LOUPE_SIZE - LOUPE_OFFSET - below_grid;
         }
 
         let center_image_pos = self.image_pos_for(ctx, cursor);
@@ -287,6 +312,30 @@ impl MagnifierState {
             egui::FontId::monospace(14.0),
             text_color,
         );
+
+        if !self.live {
+            // Drawn with its own dark backing rather than straight onto the
+            // screen: this sits on top of arbitrary desktop content, and
+            // plain text over an unknown background is a coin flip for
+            // legibility.
+            let caption = "still image · cursor shown";
+            let caption_rect = egui::Rect::from_min_size(
+                egui::pos2(loupe_origin.x, band_rect.max.y + 2.0),
+                egui::vec2(LOUPE_SIZE, STILL_CAPTION_HEIGHT),
+            );
+            painter.rect_filled(
+                caption_rect,
+                0.0,
+                egui::Color32::from_black_alpha(0xCC),
+            );
+            painter.text(
+                caption_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                caption,
+                egui::FontId::proportional(10.0),
+                egui::Color32::from_gray(0xDD),
+            );
+        }
     }
 }
 
@@ -309,18 +358,20 @@ struct MagnifierApp {
     state: MagnifierState,
     /// Held for the lifetime of the overlay so the feed stays live; see
     /// `run`'s doc comment.
-    capture: crate::screencast::Capture,
+    capture: crate::screencast::ScreenSource,
     result_tx: std::sync::mpsc::Sender<Rgb>,
 }
 
 impl MagnifierApp {
     fn new(
         first_frame: RgbImage,
-        capture: crate::screencast::Capture,
+        capture: crate::screencast::ScreenSource,
         result_tx: std::sync::mpsc::Sender<Rgb>,
     ) -> Self {
+        let mut state = MagnifierState::new(first_frame);
+        state.live = capture.is_live();
         Self {
-            state: MagnifierState::new(first_frame),
+            state,
             capture,
             result_tx,
         }

@@ -58,7 +58,7 @@ fn main() -> anyhow::Result<()> {
     // to the reactor it first saw, so a runtime that dies leaves that
     // connection pointing at nothing. See runtime.rs.
     if matches!(cli.command, Command::Magnify) {
-        let (capture, first_frame) = runtime::shared()?.block_on(screencast::Capture::open())?;
+        let (capture, first_frame) = runtime::shared()?.block_on(screencast::open_best())?;
 
         return match magnifier::run(first_frame, capture)? {
             Some(color) => {

@@ -99,6 +99,113 @@ struct StreamDiagnostics {
     frames_decoded: AtomicU32,
 }
 
+/// Remembers, for this process only, that the user declined the
+/// screen-share prompt.
+///
+/// Without it, every single pick would re-prompt someone who has already
+/// said no — which is both annoying and the kind of nagging that trains
+/// people to click through permission dialogs without reading them.
+///
+/// Deliberately *not* persisted to disk, unlike the restore token. A
+/// remembered "no" with no visible way to take it back is a trap: the user
+/// would have to know a config file exists to ever get the live magnifier
+/// again. Restarting the app is a discoverable reset; a stale file on disk
+/// is not.
+static SCREENCAST_DECLINED: AtomicBool = AtomicBool::new(false);
+
+/// Where the magnifier's pixels come from. Two speeds, as it were.
+///
+/// The variants differ in more than liveness, and callers showing a
+/// magnifier should be aware of both differences:
+///
+/// | | [`Self::Live`] | [`Self::Still`] |
+/// |---|---|---|
+/// | Portal | `ScreenCast` + PipeWire | `Screenshot` |
+/// | Updates | continuously | never |
+/// | Mouse cursor | hidden | baked into the image |
+pub enum ScreenSource {
+    /// A running ScreenCast session pushing new frames.
+    Live(Capture),
+    /// A single `Screenshot` frame, already handed to the caller. Holds
+    /// nothing because there is nothing left running.
+    Still,
+}
+
+impl ScreenSource {
+    /// The newest frame, if one has arrived since the last call.
+    ///
+    /// Always `None` for [`Self::Still`] — there is no second frame — which
+    /// is exactly what a caller doing `if let Some(f) = source.take_frame()`
+    /// needs: it simply keeps displaying the image it already has.
+    pub fn take_frame(&self) -> Option<RgbImage> {
+        match self {
+            Self::Live(capture) => capture.take_frame(),
+            Self::Still => None,
+        }
+    }
+
+    /// Whether this source updates. Callers can use it to label the
+    /// degraded mode in their UI.
+    pub fn is_live(&self) -> bool {
+        matches!(self, Self::Live(_))
+    }
+}
+
+/// Opens the best screen source available, falling back when the user
+/// declines the screen-share prompt.
+///
+/// Order of attempts:
+///
+/// 1. `ScreenCast` — live feed, cursor hidden. Skipped outright if the user
+///    already declined once this run (see [`SCREENCAST_DECLINED`]).
+/// 2. `Screenshot` — a still frame, cursor included.
+///
+/// Only an explicit *refusal* triggers the fallback. Every other failure
+/// propagates, on purpose: silently degrading on a technical error would
+/// throw away the diagnostics `Capture::no_frame_error` works to produce,
+/// and would turn "DMA-BUF is unsupported on this compositor" into the much
+/// harder-to-chase "the magnifier is mysteriously never live".
+pub async fn open_best() -> anyhow::Result<(ScreenSource, RgbImage)> {
+    if !SCREENCAST_DECLINED.load(Ordering::Relaxed) {
+        match Capture::open().await {
+            Ok((capture, first)) => return Ok((ScreenSource::Live(capture), first)),
+            Err(err) if is_user_refusal(&err) => {
+                SCREENCAST_DECLINED.store(true, Ordering::Relaxed);
+                eprintln!(
+                    "colza: screen sharing declined — falling back to a still screenshot. \
+                     The magnifier will not track changes on screen, and the mouse cursor \
+                     will appear in the captured image. Restart colza to be asked again."
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    let still = crate::portal::capture_screen().await?;
+    Ok((ScreenSource::Still, still))
+}
+
+/// Whether this error is the user saying no, as opposed to something
+/// breaking.
+///
+/// The portal reports a declined request as a normal response carrying
+/// `ResponseType::Cancelled`, which ashpd surfaces as
+/// `Error::Response(ResponseError::Cancelled)`. Because our errors travel as
+/// `anyhow::Error`, recovering that requires a downcast — which works here
+/// only because `ashpd::Error` implements `std::error::Error`.
+///
+/// Note this also matches the user dismissing the dialog with Escape rather
+/// than clicking a "deny" button; the portal makes no distinction, and
+/// neither should we.
+fn is_user_refusal(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<ashpd::Error>(),
+        Some(ashpd::Error::Response(
+            ashpd::desktop::ResponseError::Cancelled
+        ))
+    )
+}
+
 /// A live ScreenCast session: a portal session, a PipeWire stream, and the
 /// thread pumping frames out of it.
 ///

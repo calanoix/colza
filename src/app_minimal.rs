@@ -26,7 +26,7 @@ use image::RgbImage;
 
 use crate::color::Rgb;
 use crate::magnifier::MagnifierState;
-use crate::screencast::Capture;
+use crate::screencast::ScreenSource;
 
 /// Dedicated id for the magnifier's viewport, so we can refer to the same
 /// native window across frames (open it once, keep updating it, close it
@@ -61,7 +61,7 @@ enum Mode {
     /// block `update()` (a previous version of this file deadlocked here).
     Capturing(
         Target,
-        std::sync::mpsc::Receiver<anyhow::Result<(Capture, RgbImage)>>,
+        std::sync::mpsc::Receiver<anyhow::Result<(ScreenSource, RgbImage)>>,
     ),
     /// First frame in hand; the magnifier viewport is open and sampling
     /// `state` for `Target`.
@@ -74,7 +74,7 @@ enum Mode {
     /// `MagnifierState` is boxed because it owns a full-resolution
     /// `RgbImage` and we don't want that heavy to sit inline in `Mode`
     /// while we're in `Normal`/`Capturing`.
-    Magnifying(Target, Box<MagnifierState>, Capture),
+    Magnifying(Target, Box<MagnifierState>, ScreenSource),
 }
 
 /// Parses `#rrggbb`, `rrggbb`, or `rgb(r, g, b)` — direct port of
@@ -268,11 +268,16 @@ impl MinimalApp {
         self.update_contrast();
     }
 
-    /// Kicks off the pick flow for `target`: spawn `Capture::open()` as a
-    /// task on the process-wide runtime and send the resulting live session
-    /// (plus its first frame) back over a channel. Returns immediately —
-    /// nothing here blocks the calling `update()` frame (blocking here
-    /// previously caused a freeze).
+    /// Kicks off the pick flow for `target`: spawn `screencast::open_best()`
+    /// as a task on the process-wide runtime and send the resulting
+    /// `ScreenSource` (plus its first frame) back over a channel. Returns
+    /// immediately — nothing here blocks the calling `update()` frame
+    /// (blocking here previously caused a freeze).
+    ///
+    /// Which source comes back — live ScreenCast or a still screenshot —
+    /// depends on whether the user granted screen sharing; this function
+    /// doesn't care, and neither does the `Magnifying` arm beyond labelling
+    /// it.
     ///
     /// A `tokio::spawn` on `runtime::shared()`, rather than the OS thread +
     /// per-click `current_thread` runtime this used to do: that pattern
@@ -296,7 +301,7 @@ impl MinimalApp {
         match crate::runtime::shared() {
             Ok(rt) => {
                 rt.spawn(async move {
-                    let _ = tx.send(Capture::open().await);
+                    let _ = tx.send(crate::screencast::open_best().await);
                 });
             }
             // Sending the error rather than dropping `tx` silently: the
@@ -432,12 +437,13 @@ impl eframe::App for MinimalApp {
             Mode::Normal => {}
 
             Mode::Capturing(target, rx) => match rx.try_recv() {
-                Ok(Ok((capture, first_frame))) => {
-                    self.mode = Mode::Magnifying(
-                        *target,
-                        Box::new(MagnifierState::new(first_frame)),
-                        capture,
-                    );
+                Ok(Ok((source, first_frame))) => {
+                    let mut state = MagnifierState::new(first_frame);
+                    // Labels the loupe when we fell back to a still
+                    // screenshot, so a frozen image with a cursor in it
+                    // reads as the degraded mode rather than a bug.
+                    state.live = source.is_live();
+                    self.mode = Mode::Magnifying(*target, Box::new(state), source);
                     // Without this, nothing schedules the *next* frame —
                     // the one that will actually call show_viewport_immediate
                     // for the magnifier below — until some external input
