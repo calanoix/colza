@@ -17,13 +17,6 @@ impl Rgb {
         Self { r, g, b }
     }
 
-    /// Builds from the (f64, f64, f64) 0.0..=1.0 triple that ashpd's
-    /// `Color::pick()` returns.
-    pub fn from_unit_floats(r: f64, g: f64, b: f64) -> Self {
-        let to_u8 = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-        Self::new(to_u8(r), to_u8(g), to_u8(b))
-    }
-
     pub fn to_hex(self) -> String {
         format!("#{:02X}{:02X}{:02X}", self.r, self.g, self.b)
     }
@@ -67,48 +60,6 @@ pub fn contrast_ratio(a: Rgb, b: Rgb) -> f64 {
     let lb = b.relative_luminance();
     let (lighter, darker) = if la >= lb { (la, lb) } else { (lb, la) };
     (lighter + 0.05) / (darker + 0.05)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WcagLevel {
-    Fail,
-    AaLargeOnly,
-    Aa,
-    Aaa,
-}
-
-impl fmt::Display for WcagLevel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            WcagLevel::Fail => "FAIL",
-            WcagLevel::AaLargeOnly => "AA (large text only)",
-            WcagLevel::Aa => "AA",
-            WcagLevel::Aaa => "AAA",
-        };
-        write!(f, "{s}")
-    }
-}
-
-/// Classifies a contrast ratio for normal-size text against the WCAG 2.x
-/// thresholds (4.5:1 for AA, 7:1 for AAA; large text is 3:1 / 4.5:1).
-pub fn wcag_level(ratio: f64, large_text: bool) -> WcagLevel {
-    if large_text {
-        if ratio >= 4.5 {
-            WcagLevel::Aaa
-        } else if ratio >= 3.0 {
-            WcagLevel::Aa
-        } else {
-            WcagLevel::Fail
-        }
-    } else if ratio >= 7.0 {
-        WcagLevel::Aaa
-    } else if ratio >= 4.5 {
-        WcagLevel::Aa
-    } else if ratio >= 3.0 {
-        WcagLevel::AaLargeOnly
-    } else {
-        WcagLevel::Fail
-    }
 }
 
 #[cfg(test)]

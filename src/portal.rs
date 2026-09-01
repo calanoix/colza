@@ -13,28 +13,7 @@
 //! system cursor baked in and never updates — `screencast.rs`'s
 //! PipeWire-based capture is used instead whenever the user grants it.
 
-use crate::color::Rgb;
 use image::RgbImage;
-
-/// Asks the desktop portal to let the user click a pixel anywhere on
-/// screen and returns its color. Blocks (asynchronously) until the user
-/// clicks or cancels the compositor-drawn picker.
-///
-/// This is the lowest-privilege path in the app: the compositor samples
-/// the pixel itself and hands back three floats, so no screen contents
-/// ever reach this process and nothing persistent is granted.
-pub async fn pick_color() -> anyhow::Result<Rgb> {
-    let color = ashpd::desktop::Color::pick()
-        .send()
-        .await?
-        .response()?;
-
-    Ok(Rgb::from_unit_floats(
-        color.red(),
-        color.green(),
-        color.blue(),
-    ))
-}
 
 /// Asks the desktop portal for a full-screen screenshot and decodes it to
 /// an in-memory RGB image.
