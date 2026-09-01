@@ -54,7 +54,12 @@ pub async fn capture_screen() -> anyhow::Result<RgbImage> {
         .response()?;
 
     let uri = response.uri();
-    let path = uri
+    // ashpd 0.13's `Uri` is a lightweight string wrapper with no file-path
+    // conversion of its own (it replaced the old `url::Url`-backed type),
+    // so `url` — already a dependency — does the `file://` -> path parsing.
+    let parsed = url::Url::parse(uri.as_str())
+        .map_err(|err| anyhow::anyhow!("portal returned an unparseable URI '{uri}': {err}"))?;
+    let path = parsed
         .to_file_path()
         .map_err(|_| anyhow::anyhow!("portal returned a non-local URI: {uri}"))?;
 

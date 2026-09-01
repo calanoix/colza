@@ -6,17 +6,21 @@ description = "Color picker and WCAG contrast checker for Wayland (GNOME/KDE) vi
 license = "MIT"
 
 [dependencies]
-# ashpd 0.9 has no per-portal feature split (that came in 0.13), so every
-# portal module is always compiled; `default-features = false` only picks
-# the async backend. We need "tokio" since main.rs drives portal calls from
-# a tokio runtime, and ashpd refuses to combine "tokio" with the default
-# "async-std" backend.
+# ashpd 0.13 splits each portal into its own feature, so every module we
+# actually use has to be named explicitly:
+#   - "screenshot" gates both ashpd::desktop::screenshot AND
+#     ashpd::desktop::Color (portal.rs uses both: pick_color + capture_screen)
+#   - "screencast" gates ashpd::desktop::screencast and PersistMode
+#     (screencast.rs's live capture path)
+# `default-features = false` only picks the async backend. We need "tokio"
+# since main.rs drives portal calls from a tokio runtime, and ashpd refuses
+# to combine "tokio" with the default "async-std" backend.
 #
 # Do NOT add ashpd's "pipewire" feature: it pins pipewire-sys to a links
 # value that conflicts with our own `pipewire` dependency below, and cargo
 # only allows one crate per links value. We don't need it anyway —
 # screencast.rs talks to pipewire 0.10 directly via a plain OwnedFd.
-ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "screenshot", "screencast"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

@@ -27,10 +27,9 @@
 
 use crate::token_store;
 use ashpd::desktop::{
-    screencast::{CursorMode, Screencast, SourceType},
+    screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
     PersistMode, Session,
 };
-use ashpd::WindowIdentifier;
 use image::RgbImage;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -195,7 +194,7 @@ pub struct Capture {
     /// Kept alive purely so the compositor keeps feeding the stream —
     /// closing the session tears the PipeWire node down. `Option` only so
     /// `Drop` can move it out.
-    session: Option<Session<'static, Screencast<'static>>>,
+    session: Option<Session<Screencast>>,
     diagnostics: Arc<StreamDiagnostics>,
 }
 
@@ -210,34 +209,34 @@ impl Capture {
     /// Must be awaited on `runtime::shared()`: ashpd's cached D-Bus
     /// connection binds to the first runtime it sees (see runtime.rs).
     pub async fn open() -> anyhow::Result<(Self, RgbImage)> {
-        let proxy: Screencast<'static> = Screencast::new().await?;
-        let session = proxy.create_session().await?;
+        let proxy: Screencast = Screencast::new().await?;
+        let session = proxy.create_session(Default::default()).await?;
 
         proxy
             .select_sources(
                 &session,
-                CursorMode::Hidden,
-                SourceType::Monitor.into(),
-                // Only ever one output: asking for multiple just adds a
-                // "select all the ones you want" step to the picker dialog
-                // for no benefit here.
-                false,
-                // The saved token plus `ExplicitlyRevoked` are what
-                // suppress the picker dialog on later runs. `Application`
-                // would only persist for the running process, so it would
-                // still prompt once per launch.
-                token_store::load().as_deref(),
-                PersistMode::ExplicitlyRevoked,
+                SelectSourcesOptions::default()
+                    .set_cursor_mode(CursorMode::Hidden)
+                    .set_sources(Some(SourceType::Monitor.into()))
+                    // Only ever one output: asking for multiple just adds
+                    // a "select all the ones you want" step to the picker
+                    // dialog for no benefit here.
+                    .set_multiple(false)
+                    // The saved token plus `ExplicitlyRevoked` are what
+                    // suppress the picker dialog on later runs.
+                    // `Application` would only persist for the running
+                    // process, so it would still prompt once per launch.
+                    .set_restore_token(token_store::load().as_deref())
+                    .set_persist_mode(PersistMode::ExplicitlyRevoked),
             )
             .await?
             .response()?;
 
-        // `WindowIdentifier::default()` (the `None` variant) means the
-        // dialog, on runs where it appears, isn't parented to our window —
-        // exporting a real handle would need ashpd's wayland/gtk4 features
-        // and access to eframe's surface.
+        // `None` here means the dialog, on runs where it appears, isn't
+        // parented to our window — exporting a real handle would need
+        // ashpd's wayland/gtk4 features and access to eframe's surface.
         let response = proxy
-            .start(&session, &WindowIdentifier::default())
+            .start(&session, None, Default::default())
             .await?
             .response()?;
 
@@ -254,7 +253,9 @@ impl Capture {
             .ok_or_else(|| anyhow::anyhow!("compositor returned no screencast streams"))?;
         let node_id = stream.pipe_wire_node_id();
 
-        let pw_fd = proxy.open_pipe_wire_remote(&session).await?;
+        let pw_fd = proxy
+            .open_pipe_wire_remote(&session, Default::default())
+            .await?;
 
         let latest: Arc<Mutex<Option<RgbImage>>> = Arc::new(Mutex::new(None));
         let diagnostics: Arc<StreamDiagnostics> = Arc::default();
