@@ -1,9 +1,3 @@
-//! Wraps the two `org.freedesktop.portal.Screenshot` requests this app
-//! uses:
-//!
-//! - [`pick_color`] (`PickColor`), used by the CLI `pick` subcommand: the
-//!   compositor draws its own eyedropper and we just get back one RGB
-//!   value.
 //! - [`capture_screen`] (`Screenshot`), the fallback capture path used when
 //!   the user declines the ScreenCast permission (see
 //!   `screencast::open_best`): a full-screen PNG we decode and zoom into

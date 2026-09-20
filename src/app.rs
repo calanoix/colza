@@ -431,7 +431,7 @@ impl eframe::App for App {
 pub fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
-        viewport: egui::ViewportBuilder::default().with_inner_size([320.0, 480.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([275.0, 375.0]),
         ..Default::default()
     };
 
