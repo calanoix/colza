@@ -226,30 +226,101 @@ fn channel_slider(ui: &mut egui::Ui, name: &str, a11y_prefix: &str, value: &mut 
     changed
 }
 
-/// A small eyedropper drawn with strokes, so no icon font is needed.
+/// SVG path from `eye-dropper-solid-full.svg` (Font Awesome Free 7.3.1).
+/// The SVG's M/L/C commands are sampled into egui paths at runtime, so the
+/// icon uses the supplied vector shape rather than a hand-drawn approximation.
+const EYEDROPPER_SVG_PATH: &str = "M405.6 93.2 L304 194.8 L294.6 185.4 C282.1 172.9 261.8 172.9 249.3 185.4 C236.8 197.9 236.8 218.2 249.3 230.7 L409.3 390.7 C421.8 403.2 442.1 403.2 454.6 390.7 C467.1 378.2 467.1 357.9 454.6 345.4 L445.2 336 L546.8 234.4 C585.8 195.4 585.8 132.2 546.8 93.3 C507.8 54.4 444.6 54.3 405.7 93.3 z M119.4 387.3 C104.4 402.3 96 422.7 96 443.9 L96 486.3 L69.4 526.2 C60.9 538.9 62.6 555.8 73.4 566.6 C84.2 577.4 101.1 579.1 113.8 570.6 L153.7 544 L196.1 544 C217.3 544 237.7 535.6 252.7 520.6 L362.1 411.2 L316.8 365.9 L207.4 475.3 C204.4 478.3 200.3 480 196.1 480 L160 480 L160 443.9 C160 439.7 161.7 435.6 164.7 432.6 L274.1 323.2 L228.8 277.9 z";
+
+/// Parses the small SVG path subset used by the supplied icon (M, L, C, z).
+fn eyedropper_svg_polygons() -> Vec<Vec<egui::Pos2>> {
+    fn number(bytes: &[u8], i: &mut usize) -> f32 {
+        while *i < bytes.len() && (bytes[*i].is_ascii_whitespace() || bytes[*i] == b',') {
+            *i += 1;
+        }
+        let start = *i;
+        while *i < bytes.len()
+            && (bytes[*i].is_ascii_digit() || matches!(bytes[*i], b'.' | b'-' | b'+' | b'e' | b'E'))
+        {
+            *i += 1;
+        }
+        std::str::from_utf8(&bytes[start..*i]).unwrap().parse().unwrap()
+    }
+
+    let bytes = EYEDROPPER_SVG_PATH.as_bytes();
+    let mut i = 0;
+    let mut command = b' ';
+    let mut current = egui::pos2(0.0, 0.0);
+    let mut start = current;
+    let mut points = Vec::new();
+    let mut polygons = Vec::new();
+
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') { i += 1; }
+        if i >= bytes.len() { break; }
+        if bytes[i].is_ascii_alphabetic() { command = bytes[i]; i += 1; }
+        match command {
+            b'M' | b'L' => {
+                let point = egui::pos2(number(bytes, &mut i), number(bytes, &mut i));
+                if command == b'M' {
+                    if !points.is_empty() { polygons.push(std::mem::take(&mut points)); }
+                    start = point;
+                    command = b'L';
+                }
+                current = point;
+                points.push(point);
+            }
+            b'C' => {
+                let p0 = current;
+                let p1 = egui::pos2(number(bytes, &mut i), number(bytes, &mut i));
+                let p2 = egui::pos2(number(bytes, &mut i), number(bytes, &mut i));
+                let p3 = egui::pos2(number(bytes, &mut i), number(bytes, &mut i));
+                for step in 1..=8 {
+                    let t = step as f32 / 8.0;
+                    let u = 1.0 - t;
+                    points.push(egui::pos2(
+                        u*u*u*p0.x + 3.0*u*u*t*p1.x + 3.0*u*t*t*p2.x + t*t*t*p3.x,
+                        u*u*u*p0.y + 3.0*u*u*t*p1.y + 3.0*u*t*t*p2.y + t*t*t*p3.y,
+                    ));
+                }
+                current = p3;
+            }
+            b'z' | b'Z' => {
+                current = start;
+                if !points.is_empty() { polygons.push(std::mem::take(&mut points)); }
+                command = b' ';
+            }
+            _ => break,
+        }
+    }
+    if !points.is_empty() { polygons.push(points); }
+    polygons
+}
+
 fn paint_eyedropper(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let c = rect.center();
-    let p = |x: f32, y: f32| c + egui::vec2(x, y);
-    painter.line_segment(
-        [p(-7.0, 7.0), p(3.0, -3.0)],
-        egui::Stroke::new(4.0, color),
-    );
-    painter.line_segment(
-        [p(-10.0, 10.0), p(-7.0, 7.0)],
-        egui::Stroke::new(2.0, color),
-    );
-    painter.line_segment(
-        [p(2.0, -7.0), p(7.0, -2.0)],
-        egui::Stroke::new(6.0, color),
-    );
-    painter.circle_filled(p(8.0, -8.0), 3.5, color);
+    // Render the SVG path at 20 px wide, centered inside the 38 x 38 px hit target.
+    // The visible path spans approximately 526 units in the 640 x 640 viewBox.
+    let scale = 20.0 / 526.0;
+    let origin = rect.center() - egui::vec2(323.0 * scale, 315.0 * scale);
+    for polygon in eyedropper_svg_polygons() {
+        let points = polygon.into_iter()
+            .map(|p| origin + egui::vec2(p.x * scale, p.y * scale))
+            .collect();
+        painter.add(egui::Shape::Path(egui::epaint::PathShape {
+            points,
+            closed: true,
+            fill: color,
+            stroke: egui::Stroke::NONE.into(),
+        }));
+    }
 }
 
 /// A double arrow (⇄) drawn with strokes, like the eyedropper: no icon
 /// font needed.
 fn paint_swap(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    // Draw a 20 px icon centered in the larger clickable area.
     let c = rect.center();
-    let p = |x: f32, y: f32| c + egui::vec2(x, y);
+    let scale = 20.0 / 18.0;
+    let p = |x: f32, y: f32| c + egui::vec2(x * scale, y * scale);
     let s = egui::Stroke::new(2.0, color);
     // Top arrow, pointing right.
     painter.line_segment([p(-9.0, -4.0), p(9.0, -4.0)], s);
@@ -299,15 +370,26 @@ impl ColorRowState {
     /// coordinates) of the swatch/text/eyedropper row, so the caller can
     /// align the swap button with it.
     fn ui(&mut self, ui: &mut egui::Ui, picking: bool, on_pick: impl FnOnce()) -> f32 {
-        // Format dropdown.
+        // Compact format dropdown, transparent in every interaction state.
         let before = self.format;
-        egui::ComboBox::from_id_salt((self.label, "format"))
-            .selected_text(egui::RichText::new(self.format.name()).size(18.0).strong())
-            .show_ui(ui, |ui| {
-                for f in ColorFormat::ALL {
-                    ui.selectable_value(&mut self.format, f, f.name());
-                }
-            });
+        ui.scope(|ui| {
+            let visuals = &mut ui.style_mut().visuals;
+            for widget in [&mut visuals.widgets.inactive, &mut visuals.widgets.hovered, &mut visuals.widgets.active] {
+                // Keep the outline, but remove the grey fill.
+                widget.bg_fill = egui::Color32::TRANSPARENT;
+                widget.weak_bg_fill = egui::Color32::TRANSPARENT;
+            }
+            ui.spacing_mut().button_padding = egui::vec2(3.0, 2.0);
+            ui.spacing_mut().combo_width = 88.0;
+            egui::ComboBox::from_id_salt((self.label, "format"))
+                .width(88.0)
+                .selected_text(egui::RichText::new(self.format.name()).size(16.0).strong())
+                .show_ui(ui, |ui| {
+                    for f in ColorFormat::ALL {
+                        ui.selectable_value(&mut self.format, f, f.name());
+                    }
+                });
+        });
         if self.format != before {
             self.sync_text();
         }
@@ -360,14 +442,29 @@ impl ColorRowState {
                 self.sync_text();
             }
 
-            // Disabled mid-pick so a double click on either row can't start
-            // two captures at once.
-            let btn = ui.add_enabled(
-                !picking,
-                egui::Button::new("").min_size(egui::vec2(38.0, 38.0)),
+            // Frameless eyedropper: allocate the hit target directly so no
+            // button background can appear on hover, press, or focus.
+            let (icon_rect, btn) = ui.allocate_exact_size(
+                egui::vec2(38.0, 38.0),
+                if picking { egui::Sense::hover() } else { egui::Sense::click() },
             );
-            let icon_color = if picking { egui::Color32::GRAY } else { INK };
-            paint_eyedropper(ui.painter(), btn.rect, icon_color);
+            let icon_color = egui::Color32::from_rgb(0x5F, 0x63, 0x68);
+            if btn.hovered() && !picking {
+                ui.painter().rect_filled(
+                    icon_rect,
+                    6.0,
+                    egui::Color32::from_rgb(0xF1, 0xF3, 0xF4),
+                );
+            }
+            paint_eyedropper(ui.painter(), icon_rect, icon_color);
+            if btn.has_focus() {
+                ui.painter().rect_stroke(
+                    icon_rect,
+                    6.0,
+                    egui::Stroke::new(2.0, FOCUS_BLUE),
+                    egui::StrokeKind::Outside,
+                );
+            }
             let name = format!("Pick {} color from screen", self.label.to_lowercase());
             btn.widget_info(|| {
                 egui::WidgetInfo::labeled(egui::WidgetType::Button, !picking, name.clone())
@@ -481,19 +578,19 @@ impl App {
             )
         });
 
-        let v = ui.style().interact(&resp);
-        ui.painter().rect(
-            rect,
-            v.corner_radius,
-            v.weak_bg_fill,
-            v.bg_stroke,
-            egui::StrokeKind::Inside,
-        );
-        paint_swap(ui.painter(), rect, INK);
+        let icon_color = egui::Color32::from_rgb(0x5F, 0x63, 0x68);
+        if resp.hovered() {
+            ui.painter().rect_filled(
+                rect,
+                6.0,
+                egui::Color32::from_rgb(0xF1, 0xF3, 0xF4),
+            );
+        }
+        paint_swap(ui.painter(), rect, icon_color);
         if resp.has_focus() {
             ui.painter().rect_stroke(
-                rect.expand(2.0),
-                8.0,
+                rect,
+                6.0,
                 egui::Stroke::new(2.0, FOCUS_BLUE),
                 egui::StrokeKind::Outside,
             );
@@ -584,25 +681,17 @@ impl App {
 
 impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Garantit qu'aucun fond noir opaque n'est appliqué par défaut avant le rendu
         [0.0, 0.0, 0.0, 0.0]
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // eframe 0.36 hands us the root Ui directly rather than a
-        // Context; ctx is still needed below for viewport commands and
-        // show_viewport_immediate, so it's grabbed once up front.
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
 
-        // Main window: always drawn, every frame, regardless of mode. This
-        // is what keeps it visible while the loupe viewport is up.
         let picking = !matches!(self.mode, Mode::Normal);
         let mut pick_target: Option<Target> = None;
         let mut swap_requested = false;
 
-        // Recomputed every frame from the current colors, so there is no
-        // cached ratio to go stale.
         let (bg_eff, fg_eff) = self.effective();
         let ratio = crate::color::contrast_ratio(fg_eff, bg_eff);
 
@@ -613,7 +702,6 @@ impl eframe::App for App {
                     .inner_margin(24.0),
             )
             .show(ui, |ui| {
-                // Three equal columns plus the slot for the swap button.
                 let col_w =
                     ((ui.available_width() - 3.0 * COL_GAP - SWAP_SIZE) / 3.0).max(0.0);
 
@@ -637,8 +725,6 @@ impl eframe::App for App {
                         })
                         .inner;
 
-                    // Swap button, centered in its slot and vertically
-                    // aligned with the swatch/text/eyedropper row.
                     let (slot, _) = ui.allocate_exact_size(
                         egui::vec2(SWAP_SIZE, 1.0),
                         egui::Sense::hover(),
@@ -668,8 +754,6 @@ impl eframe::App for App {
             self.start_picking(target);
         }
 
-        // Mode-driven side effects: polling the capture, running the
-        // magnifier viewport.
         match &mut self.mode {
             Mode::Normal => {}
 
@@ -716,7 +800,6 @@ impl eframe::App for App {
 
                         let input = state.handle_input(ctx);
 
-                        // Frame::NONE empêche de peindre l'arrière-plan opaque du thème egui
                         egui::CentralPanel::default()
                             .frame(egui::Frame::NONE)
                             .show(ui, |ui| {
@@ -752,13 +835,6 @@ impl eframe::App for App {
     }
 }
 
-/// Embeds Roboto Regular as the default proportional font, and registers
-/// Roboto Bold as its own family (see [`bold`]) since egui has no
-/// synthetic bold. The default egui fonts stay in both stacks as a
-/// fallback for glyphs Roboto lacks.
-///
-/// Expects `assets/Roboto-Regular.ttf` and `assets/Roboto-Bold.ttf`
-/// next to `Cargo.toml`.
 fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
@@ -793,11 +869,10 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// Light theme, white panel, rounded widgets.
 fn setup_style(ctx: &egui::Context) {
     let mut v = egui::Visuals::light();
     v.panel_fill = egui::Color32::WHITE;
-    v.extreme_bg_color = egui::Color32::WHITE; // text field background
+    v.extreme_bg_color = egui::Color32::WHITE;
     let r = egui::CornerRadius::same(8);
     v.widgets.inactive.corner_radius = r;
     v.widgets.hovered.corner_radius = r;
