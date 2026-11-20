@@ -8,7 +8,9 @@
 //!     button;
 //!   - right (grey): Foreground and Background "cards", each as tall as
 //!     its content (format dropdown, swatch, text field, eyedropper,
-//!     R/G/B/Alpha sliders with gradient rails and value readouts).
+//!     three sliders for the chosen format's model — R/G/B, H/S/L or
+//!     OkLCh's L/C/H — plus Alpha, with gradient rails and value
+//!     readouts).
 //!
 //! Picking a color opens the magnifier as a second egui viewport so the
 //! main window stays visible while the loupe is up.
@@ -25,7 +27,7 @@ use std::sync::Arc;
 use eframe::egui;
 use image::RgbImage;
 
-use crate::color::Rgb;
+use crate::color::{fmt_num, Hsl, Oklch, Rgb};
 use crate::magnifier::MagnifierState;
 use crate::screencast::ScreenSource;
 
@@ -117,7 +119,10 @@ const CARD_MARGIN: f32 = 16.0;
 const LEFT_WIDTH: f32 = 260.0;
 /// Fixed window size (the window is not resizable). The height fits the
 /// tallest section (the left one, with the swap button under the criteria).
-const WINDOW_SIZE: [f32; 2] = [840.0, 416.0];
+/// The width is set by the longest text the color field must show whole:
+/// an OkLCh value like `oklch(56.36% 0.29123 302.15)` measures ~163px in
+/// Roboto 12px, and at 840px wide the field only had 140px of text area.
+const WINDOW_SIZE: [f32; 2] = [896.0, 416.0];
 /// Extra vertical space between two sliders (on top of the card's spacing).
 const SLIDER_GAP: f32 = 6.0;
 /// Space between the vertical line and the color cards.
@@ -167,52 +172,192 @@ enum Mode {
     Magnifying(Target, Box<MagnifierState>, ScreenSource),
 }
 
-/// How a color is written in the text field.
+/// How a color is written in the text field, and which model the three
+/// sliders under it edit.
+///
+/// HSL rather than HSV: both are the same cylinder-over-sRGB idea, but
+/// HSL is the one CSS speaks (`hsl()`), so its text pastes straight into
+/// a stylesheet, like every other format here. OkLCh is the perceptual
+/// one: its L tracks how light a color *looks* across hues, which makes
+/// it the better slider to reach for when nudging a pair toward a passing
+/// ratio without changing its character.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ColorFormat {
     Hex,
     Rgb,
+    Hsl,
+    Oklch,
 }
 
+/// One slider's range and units. Every range starts at 0.
+struct Channel {
+    name: &'static str,
+    max: f64,
+    /// Arrow-key step, and the grid pointer drags snap to.
+    step: f64,
+    /// Shift+arrow step.
+    big_step: f64,
+    /// Decimals in the readout. The text field always carries the full
+    /// precision, so the readout can stay compact.
+    decimals: usize,
+    unit: &'static str,
+}
+
+impl Channel {
+    const fn new(name: &'static str, max: f64, step: f64, big_step: f64, decimals: usize, unit: &'static str) -> Self {
+        Self { name, max, step, big_step, decimals, unit }
+    }
+
+    fn readout(&self, v: f64) -> String {
+        format!("{}{}", fmt_num(v, self.decimals), self.unit)
+    }
+}
+
+const RGB_CHANNELS: [Channel; 3] = [
+    Channel::new("Red", 255.0, 1.0, 10.0, 0, ""),
+    Channel::new("Green", 255.0, 1.0, 10.0, 0, ""),
+    Channel::new("Blue", 255.0, 1.0, 10.0, 0, ""),
+];
+const HSL_CHANNELS: [Channel; 3] = [
+    Channel::new("Hue", 360.0, 1.0, 10.0, 0, "°"),
+    Channel::new("Saturation", 100.0, 1.0, 10.0, 0, "%"),
+    Channel::new("Lightness", 100.0, 1.0, 10.0, 0, "%"),
+];
+/// Chroma tops out at 0.4 because that's what CSS calls `100%`; sRGB's
+/// own maximum is ~0.32 (blue), so the top of the rail is always out of
+/// gamut — which the rail shows by flattening out.
+const OKLCH_CHANNELS: [Channel; 3] = [
+    Channel::new("Lightness", 100.0, 1.0, 10.0, 1, "%"),
+    Channel::new("Chroma", 0.4, 0.005, 0.05, 3, ""),
+    Channel::new("Hue", 360.0, 1.0, 10.0, 0, "°"),
+];
+const ALPHA_CHANNEL: Channel = Channel::new("Alpha", 255.0, 1.0, 10.0, 0, "");
+
 impl ColorFormat {
-    const ALL: [Self; 2] = [Self::Hex, Self::Rgb];
+    const ALL: [Self; 4] = [Self::Hex, Self::Rgb, Self::Hsl, Self::Oklch];
 
     fn name(self) -> &'static str {
         match self {
             Self::Hex => "HEX",
             Self::Rgb => "RGB",
+            Self::Hsl => "HSL",
+            Self::Oklch => "OKLCH",
         }
     }
 
-    fn format(self, c: Rgb) -> String {
+    fn channels(self) -> &'static [Channel; 3] {
         match self {
-            Self::Hex => c.to_hex(),
-            Self::Rgb => format!("rgb({}, {}, {})", c.r, c.g, c.b),
+            Self::Hex | Self::Rgb => &RGB_CHANNELS,
+            Self::Hsl => &HSL_CHANNELS,
+            Self::Oklch => &OKLCH_CHANNELS,
+        }
+    }
+
+    /// `c` in this format's slider units (see the `*_CHANNELS` tables).
+    fn components(self, c: Rgb) -> [f64; 3] {
+        match self {
+            Self::Hex | Self::Rgb => [c.r, c.g, c.b].map(f64::from),
+            Self::Hsl => {
+                let Hsl { h, s, l } = c.to_hsl();
+                [h, s * 100.0, l * 100.0]
+            }
+            Self::Oklch => {
+                let Oklch { l, c, h } = c.to_oklch();
+                [l * 100.0, c, h]
+            }
+        }
+    }
+
+    /// The color that components `v` name, and whether it lay outside
+    /// sRGB and had to be mapped in. Only OkLCh can be out of gamut: RGB
+    /// and HSL both describe exactly the sRGB cube.
+    fn to_rgb(self, v: [f64; 3]) -> (Rgb, bool) {
+        match self {
+            Self::Hex | Self::Rgb => {
+                let [r, g, b] = v.map(|c| c.round().clamp(0.0, 255.0) as u8);
+                (Rgb::new(r, g, b), false)
+            }
+            Self::Hsl => (Rgb::from_hsl(self.hsl(v)), false),
+            Self::Oklch => Rgb::from_oklch_mapped(self.oklch(v)),
+        }
+    }
+
+    fn hsl(self, [h, s, l]: [f64; 3]) -> Hsl {
+        Hsl { h, s: s / 100.0, l: l / 100.0 }
+    }
+
+    fn oklch(self, [l, c, h]: [f64; 3]) -> Oklch {
+        Oklch { l: l / 100.0, c, h }
+    }
+
+    /// Text for components `v`.
+    ///
+    /// Written from the components rather than from the 8-bit color, so
+    /// the field always agrees with the sliders: an OkLCh color dragged
+    /// out of gamut reads as what was asked for (as CSS would hold it),
+    /// and a gray's hue survives in HSL instead of collapsing to 0.
+    fn format(self, v: [f64; 3]) -> String {
+        match self {
+            Self::Hex => self.to_rgb(v).0.to_hex(),
+            Self::Rgb => {
+                let (c, _) = self.to_rgb(v);
+                format!("rgb({}, {}, {})", c.r, c.g, c.b)
+            }
+            Self::Hsl => self.hsl(v).to_css(),
+            Self::Oklch => self.oklch(v).to_css(),
+        }
+    }
+
+    /// Components from text written in *this* format, or `None`.
+    ///
+    /// Kept apart from [`parse_color`] (any format, to an `Rgb`) because
+    /// going through 8-bit RGB would throw away exactly what the user
+    /// typed — a hue on a gray, an out-of-gamut chroma.
+    fn parse(self, text: &str) -> Option<[f64; 3]> {
+        match self {
+            Self::Hex => {
+                let t = text.trim();
+                Some(Self::Rgb.components(Rgb::from_hex(t.strip_prefix('#').unwrap_or(t)).ok()?))
+            }
+            Self::Rgb => Some(Self::Rgb.components(parse_rgb_function(text)?)),
+            Self::Hsl => {
+                let Hsl { h, s, l } = Hsl::parse_css(text)?;
+                Some([h, s * 100.0, l * 100.0])
+            }
+            Self::Oklch => {
+                let Oklch { l, c, h } = Oklch::parse_css(text)?;
+                Some([l * 100.0, c, h])
+            }
         }
     }
 }
 
-/// Parses `#rrggbb`, `rrggbb`, or `rgb(r, g, b)`.
+/// Parses any supported format: `#rrggbb`, `rrggbb`, `rgb(r, g, b)`,
+/// `hsl(...)` or `oklch(...)` (see `color.rs` for the accepted spellings).
 fn parse_color(text: &str) -> Option<Rgb> {
+    ColorFormat::ALL
+        .into_iter()
+        .find_map(|f| f.parse(text).map(|v| f.to_rgb(v).0))
+}
+
+/// Parses `rgb(r, g, b)`.
+fn parse_rgb_function(text: &str) -> Option<Rgb> {
     let t = text.trim();
-
-    if t.to_lowercase().starts_with("rgb") {
-        let inner = t.split_once('(')?.1.strip_suffix(')')?;
-        let mut parts = inner.split(',').map(|p| p.trim().parse::<u16>());
-        let r = parts.next()?.ok()?;
-        let g = parts.next()?.ok()?;
-        let b = parts.next()?.ok()?;
-        if parts.next().is_some() {
-            return None; // extra component — not a valid rgb(...)
-        }
-        if r > 255 || g > 255 || b > 255 {
-            return None;
-        }
-        return Some(Rgb::new(r as u8, g as u8, b as u8));
+    if !t.to_lowercase().starts_with("rgb") {
+        return None;
     }
-
-    let hex = t.strip_prefix('#').unwrap_or(t);
-    Rgb::from_hex(hex).ok()
+    let inner = t.split_once('(')?.1.strip_suffix(')')?;
+    let mut parts = inner.split(',').map(|p| p.trim().parse::<u16>());
+    let r = parts.next()?.ok()?;
+    let g = parts.next()?.ok()?;
+    let b = parts.next()?.ok()?;
+    if parts.next().is_some() {
+        return None; // extra component — not a valid rgb(...)
+    }
+    if r > 255 || g > 255 || b > 255 {
+        return None;
+    }
+    Some(Rgb::new(r as u8, g as u8, b as u8))
 }
 
 /// `top` at opacity `alpha` composited over an opaque `under`.
@@ -234,19 +379,24 @@ fn color32(c: Rgb) -> egui::Color32 {
     egui::Color32::from_rgb(c.r, c.g, c.b)
 }
 
-/// Round-handle slider painted by hand: a gradient rail from `track.0` to
-/// `track.1` (so the rail previews what the channel does), a handle with an
-/// accent outline, a value readout, and pointer + keyboard support (arrows
-/// ±1, Shift+arrows ±10) with an accessible name/value. Returns true if
+/// Round-handle slider painted by hand: a gradient rail through `track`
+/// (evenly spaced stops, so the rail previews what the channel does), a
+/// handle with an accent outline, a value readout, and pointer + keyboard
+/// support (arrows ±`step`, Shift+arrows ±`big_step`) with an accessible
+/// name/value. `value` runs from 0 to `channel.max`. Returns true if
 /// `value` changed.
+///
+/// `readout` is passed in rather than derived from `channel` so the
+/// caller can annotate it (OkLCh's "out of sRGB"). Like the rail, it
+/// reflects the value at the start of the frame; a change repaints.
 fn channel_slider(
     ui: &mut egui::Ui,
     p: &Palette,
-    name: &str,
+    channel: &Channel,
     a11y_prefix: &str,
-    value: &mut u8,
-    track: (egui::Color32, egui::Color32),
-    as_percent: bool,
+    value: &mut f64,
+    readout: &str,
+    track: &[egui::Color32],
 ) -> bool {
     const R: f32 = 9.0;
 
@@ -254,13 +404,8 @@ fn channel_slider(
         ui.spacing_mut().item_spacing.y = 2.0;
 
         // Name on the left, current value on the right.
-        let readout = if as_percent {
-            format!("{}%", (*value as f32 / 255.0 * 100.0).round() as u32)
-        } else {
-            value.to_string()
-        };
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(name).size(11.0).color(p.text_secondary));
+            ui.label(egui::RichText::new(channel.name).size(11.0).color(p.text_secondary));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(egui::RichText::new(readout).size(11.0).color(p.text));
             });
@@ -270,21 +415,26 @@ fn channel_slider(
             egui::vec2(ui.available_width(), 2.0 * R),
             egui::Sense::click_and_drag(),
         );
-        let label = format!("{a11y_prefix} {name}");
-        resp.widget_info(|| egui::WidgetInfo::slider(true, *value as f64, label.clone()));
+        let label = format!("{a11y_prefix} {}", channel.name);
+        resp.widget_info(|| egui::WidgetInfo::slider(true, *value, label.clone()));
 
         let x0 = rect.left() + R;
         let x1 = rect.right() - R;
         let mut changed = false;
+        let mut set = |v: f64, value: &mut f64| {
+            let v = v.clamp(0.0, channel.max);
+            if v != *value {
+                *value = v;
+                changed = true;
+            }
+        };
 
         if resp.is_pointer_button_down_on() {
             if let Some(pos) = resp.interact_pointer_pos() {
-                let t = ((pos.x - x0) / (x1 - x0)).clamp(0.0, 1.0);
-                let v = (t * 255.0).round() as u8;
-                if v != *value {
-                    *value = v;
-                    changed = true;
-                }
+                let t = ((pos.x - x0) / (x1 - x0)).clamp(0.0, 1.0) as f64;
+                // Snapped to `step` so a drag lands on the same values the
+                // arrow keys produce, not on whatever a pixel maps to.
+                set((t * channel.max / channel.step).round() * channel.step, value);
             }
         }
 
@@ -300,45 +450,51 @@ fn channel_slider(
                     },
                 )
             });
-            let delta: i32 = ui.input_mut(|i| {
-                let mut d = 0;
+            let delta: f64 = ui.input_mut(|i| {
+                let mut d = 0.0;
                 for (key, sign) in [
-                    (egui::Key::ArrowLeft, -1),
-                    (egui::Key::ArrowDown, -1),
-                    (egui::Key::ArrowRight, 1),
-                    (egui::Key::ArrowUp, 1),
+                    (egui::Key::ArrowLeft, -1.0),
+                    (egui::Key::ArrowDown, -1.0),
+                    (egui::Key::ArrowRight, 1.0),
+                    (egui::Key::ArrowUp, 1.0),
                 ] {
                     if i.consume_key(egui::Modifiers::SHIFT, key) {
-                        d += 10 * sign;
+                        d += channel.big_step * sign;
                     } else if i.consume_key(egui::Modifiers::NONE, key) {
-                        d += sign;
+                        d += channel.step * sign;
                     }
                 }
                 d
             });
-            if delta != 0 {
-                let v = (*value as i32 + delta).clamp(0, 255) as u8;
-                if v != *value {
-                    *value = v;
-                    changed = true;
-                }
+            if delta != 0.0 {
+                // Snap first: a value derived from a picked color (say a
+                // hue of 213.7°) steps to 214/213, not 214.7/212.7.
+                let snapped = (*value / channel.step).round() * channel.step;
+                set(snapped + delta, value);
             }
         }
 
         let painter = ui.painter();
         let cy = rect.center().y;
-        let cx = x0 + (*value as f32 / 255.0) * (x1 - x0);
+        let t = (*value / channel.max).clamp(0.0, 1.0) as f32;
+        let cx = x0 + t * (x1 - x0);
 
-        // Gradient rail. It stops at the handle's travel limits, so its
-        // square ends are always hidden under the handle.
+        // Gradient rail, one quad per pair of stops. It stops at the
+        // handle's travel limits, so its square ends are always hidden
+        // under the handle.
         let rail = egui::Rect::from_min_max(egui::pos2(x0, cy - 3.0), egui::pos2(x1, cy + 3.0));
         let mut mesh = egui::Mesh::default();
-        mesh.colored_vertex(rail.left_top(), track.0);
-        mesh.colored_vertex(rail.right_top(), track.1);
-        mesh.colored_vertex(rail.right_bottom(), track.1);
-        mesh.colored_vertex(rail.left_bottom(), track.0);
-        mesh.add_triangle(0, 1, 2);
-        mesh.add_triangle(0, 2, 3);
+        let last = track.len().saturating_sub(1).max(1) as f32;
+        for (i, &color) in track.iter().enumerate() {
+            let x = rail.left() + rail.width() * i as f32 / last;
+            mesh.colored_vertex(egui::pos2(x, rail.top()), color);
+            mesh.colored_vertex(egui::pos2(x, rail.bottom()), color);
+            if i > 0 {
+                let k = 2 * i as u32;
+                mesh.add_triangle(k - 2, k - 1, k);
+                mesh.add_triangle(k - 1, k + 1, k);
+            }
+        }
         painter.add(egui::Shape::mesh(mesh));
         painter.rect_stroke(
             rail,
@@ -589,12 +745,28 @@ fn card<R>(
 }
 
 /// One color card: title + format dropdown, swatch + text + eyedropper,
-/// then R/G/B/Alpha sliders.
+/// then the format's three sliders and Alpha.
 struct ColorRowState {
     label: &'static str,
+    /// The color used for contrast. Always equal to
+    /// `format.to_rgb(components).0`.
     color: Rgb,
     alpha: u8,
     format: ColorFormat,
+    /// Slider positions in `format`'s model and units.
+    ///
+    /// Stored, not recomputed from `color` each frame, because 8-bit RGB
+    /// can't hold everything the sliders can: a gray has no hue, so
+    /// dragging HSL saturation to 0 and back would reset the hue to red;
+    /// an OkLCh chroma dragged past sRGB would snap back to the mapped
+    /// one; and every drag step would round to the nearest 8-bit color,
+    /// making the other two handles jitter. They're re-derived from
+    /// `color` only when the color comes from outside the sliders (pick,
+    /// typing another format, format switch, swap).
+    components: [f64; 3],
+    /// Whether `components` lie outside sRGB (OkLCh only), in which case
+    /// `color` is the gamut-mapped stand-in.
+    out_of_gamut: bool,
     /// Raw text in the field, kept separate from `color` so the user can
     /// type invalid/partial values without them being clobbered every frame.
     text: String,
@@ -602,24 +774,62 @@ struct ColorRowState {
 
 impl ColorRowState {
     fn new(label: &'static str, color: Rgb) -> Self {
-        Self {
+        let mut row = Self {
             label,
             color,
             alpha: 255,
             format: ColorFormat::Hex,
-            text: ColorFormat::Hex.format(color),
-        }
+            components: [0.0; 3],
+            out_of_gamut: false,
+            text: String::new(),
+        };
+        row.set_rgb(color);
+        row
     }
 
     fn sync_text(&mut self) {
-        self.text = self.format.format(self.color);
+        self.text = self.format.format(self.components);
+    }
+
+    /// Sets the color from an `Rgb`, re-deriving the sliders from it.
+    fn set_rgb(&mut self, color: Rgb) {
+        self.color = color;
+        self.components = self.format.components(color);
+        self.out_of_gamut = false;
+        self.sync_text();
+    }
+
+    /// Sets the color from slider/text components, keeping them as given.
+    fn set_components(&mut self, v: [f64; 3]) {
+        let (color, out_of_gamut) = self.format.to_rgb(v);
+        self.components = v;
+        self.color = color;
+        self.out_of_gamut = out_of_gamut;
     }
 
     /// Used by the picker: a sampled screen pixel is always opaque.
     fn set_color(&mut self, color: Rgb) {
-        self.color = color;
         self.alpha = 255;
-        self.sync_text();
+        self.set_rgb(color);
+    }
+
+    /// Rail colors for slider `i`: the color with that channel swept
+    /// across its range and the other two held. Two stops are exact for
+    /// RGB (each channel is linear in sRGB, as the mesh interpolates);
+    /// HSL and OkLCh curve, so they get enough stops to look smooth.
+    fn track(&self, i: usize) -> Vec<egui::Color32> {
+        let n = match self.format {
+            ColorFormat::Hex | ColorFormat::Rgb => 2,
+            ColorFormat::Hsl | ColorFormat::Oklch => 25,
+        };
+        let max = self.format.channels()[i].max;
+        (0..n)
+            .map(|k| {
+                let mut v = self.components;
+                v[i] = max * k as f64 / (n - 1) as f64;
+                color32(self.format.to_rgb(v).0)
+            })
+            .collect()
     }
 
     /// Draws the card contents and returns the vertical center (in screen
@@ -657,7 +867,9 @@ impl ColorRowState {
                 });
         });
         if self.format != before {
-            self.sync_text();
+            // Re-derived from the 8-bit color, so an out-of-gamut OkLCh
+            // request becomes the color actually shown, in the new format.
+            self.set_rgb(self.color);
         }
 
         // Swatch + text field + eyedropper.
@@ -697,9 +909,15 @@ impl ColorRowState {
             );
             if field.changed() {
                 // Live-parse as the user types: update color if valid,
-                // leave the text alone either way.
-                if let Some(parsed) = parse_color(&self.text) {
+                // leave the text alone either way. Text in the row's own
+                // format sets the sliders to exactly what was typed;
+                // any other format goes through RGB.
+                if let Some(v) = self.format.parse(&self.text) {
+                    self.set_components(v);
+                } else if let Some(parsed) = parse_color(&self.text) {
                     self.color = parsed;
+                    self.components = self.format.components(parsed);
+                    self.out_of_gamut = false;
                 }
             }
             if field.lost_focus() {
@@ -744,31 +962,34 @@ impl ColorRowState {
 
         // Sliders: each rail previews the channel's range for the other
         // two channels' current values.
-        let (r, g, b) = (self.color.r, self.color.g, self.color.b);
-        let c = egui::Color32::from_rgb;
+        let channels = self.format.channels();
+        let mut v = self.components;
         let mut changed = false;
-        changed |= channel_slider(
-            ui, p, "Red", self.label, &mut self.color.r,
-            (c(0, g, b), c(255, g, b)), false,
-        );
-        ui.add_space(SLIDER_GAP);
-        changed |= channel_slider(
-            ui, p, "Green", self.label, &mut self.color.g,
-            (c(r, 0, b), c(r, 255, b)), false,
-        );
-        ui.add_space(SLIDER_GAP);
-        changed |= channel_slider(
-            ui, p, "Blue", self.label, &mut self.color.b,
-            (c(r, g, 0), c(r, g, 255)), false,
-        );
+        for (i, channel) in channels.iter().enumerate() {
+            let track = self.track(i);
+            let mut readout = channel.readout(v[i]);
+            // Said next to chroma, the one value that can push OkLCh out
+            // of sRGB, so a swatch that stops changing while the handle
+            // still moves doesn't look like a bug.
+            if self.out_of_gamut && self.format == ColorFormat::Oklch && channel.name == "Chroma" {
+                readout.push_str(" · out of sRGB");
+            }
+            changed |= channel_slider(ui, p, channel, self.label, &mut v[i], &readout, &track);
+            ui.add_space(SLIDER_GAP);
+        }
         if changed {
+            self.set_components(v);
             self.sync_text();
         }
-        ui.add_space(SLIDER_GAP);
-        channel_slider(
-            ui, p, "Alpha", self.label, &mut self.alpha,
-            (p.bg, color32(self.color)), true,
-        );
+
+        let mut alpha = self.alpha as f64;
+        let alpha_readout = format!("{}%", (alpha / 255.0 * 100.0).round());
+        if channel_slider(
+            ui, p, &ALPHA_CHANNEL, self.label, &mut alpha, &alpha_readout,
+            &[p.bg, color32(self.color)],
+        ) {
+            self.alpha = alpha.round() as u8;
+        }
 
         row.response.rect.center().y
     }
@@ -817,10 +1038,21 @@ impl App {
     /// Exchanges foreground and background (color and alpha). Each row
     /// keeps its own text format.
     fn swap_colors(&mut self) {
-        std::mem::swap(&mut self.fg.color, &mut self.bg.color);
         std::mem::swap(&mut self.fg.alpha, &mut self.bg.alpha);
-        self.fg.sync_text();
-        self.bg.sync_text();
+        if self.fg.format == self.bg.format {
+            // Same model on both sides: swap the slider positions too, so
+            // a swap is lossless (a gray's hue, an out-of-gamut chroma)
+            // and swapping twice is a no-op.
+            std::mem::swap(&mut self.fg.color, &mut self.bg.color);
+            std::mem::swap(&mut self.fg.components, &mut self.bg.components);
+            std::mem::swap(&mut self.fg.out_of_gamut, &mut self.bg.out_of_gamut);
+            self.fg.sync_text();
+            self.bg.sync_text();
+        } else {
+            let (fg, bg) = (self.fg.color, self.bg.color);
+            self.fg.set_rgb(bg);
+            self.bg.set_rgb(fg);
+        }
     }
 
     /// Kicks off the pick flow for `target`: spawns `screencast::open_best()`
@@ -1368,4 +1600,73 @@ pub fn main() -> anyhow::Result<()> {
     .map_err(|err| anyhow::anyhow!("eframe failed: {err}"))?;
 
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_color_accepts_every_format() {
+        let want = Some(Rgb::new(0x33, 0x66, 0x99));
+        assert_eq!(parse_color("#336699"), want);
+        assert_eq!(parse_color("336699"), want);
+        assert_eq!(parse_color("rgb(51, 102, 153)"), want);
+        assert_eq!(parse_color("hsl(210, 50%, 40%)"), want);
+        assert_eq!(parse_color(&Rgb::new(0x33, 0x66, 0x99).to_oklch().to_css()), want);
+        assert_eq!(parse_color("hsl(210, 50%)"), None);
+    }
+
+    #[test]
+    fn field_text_matches_each_format() {
+        let mut row = ColorRowState::new("Foreground", Rgb::new(0x33, 0x66, 0x99));
+        for (format, text) in [
+            (ColorFormat::Hex, "#336699"),
+            (ColorFormat::Rgb, "rgb(51, 102, 153)"),
+            (ColorFormat::Hsl, "hsl(210, 50%, 40%)"),
+        ] {
+            row.format = format;
+            row.set_rgb(row.color);
+            assert_eq!(row.text, text);
+        }
+    }
+
+    /// The reason `components` is stored: a gray's hue must survive.
+    #[test]
+    fn hsl_hue_survives_desaturating() {
+        let mut row = ColorRowState::new("Foreground", Rgb::new(0x33, 0x66, 0x99));
+        row.format = ColorFormat::Hsl;
+        row.set_rgb(row.color);
+        let [h, _, l] = row.components;
+        row.set_components([h, 0.0, l]);
+        assert_eq!(row.color.r, row.color.b); // gray now
+        row.set_components([h, 50.0, l]);
+        assert_eq!(row.color, Rgb::new(0x33, 0x66, 0x99));
+    }
+
+    #[test]
+    fn oklch_out_of_gamut_is_flagged_and_kept() {
+        let mut row = ColorRowState::new("Foreground", Rgb::new(0, 0, 0));
+        row.format = ColorFormat::Oklch;
+        row.set_components([60.0, 0.4, 145.0]);
+        assert!(row.out_of_gamut);
+        row.sync_text();
+        assert_eq!(row.text, "oklch(60% 0.4 145)"); // what was asked for
+        // The color actually used is a real sRGB color.
+        assert!(row.color.to_oklch().c < 0.4);
+    }
+
+    #[test]
+    fn swapping_twice_is_lossless() {
+        let mut app = App::default();
+        app.fg.format = ColorFormat::Oklch;
+        app.bg.format = ColorFormat::Oklch;
+        app.fg.set_components([60.0, 0.4, 145.0]); // out of gamut
+        app.bg.set_components([95.0, 0.0, 200.0]); // gray with a hue
+        let (fg, bg) = (app.fg.components, app.bg.components);
+        app.swap_colors();
+        assert_eq!(app.fg.components, bg);
+        app.swap_colors();
+        assert_eq!((app.fg.components, app.bg.components), (fg, bg));
+        assert!(app.fg.out_of_gamut);
+    }
 }
