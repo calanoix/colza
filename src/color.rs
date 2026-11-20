@@ -1,5 +1,5 @@
-//! Color representation, conversions (HSL, OkLCh) and WCAG 2.x contrast
-//! math.
+//! Color representation, conversions (HSL, OkLCh) and contrast math
+//! (WCAG 2.x ratio, APCA Lc).
 //!
 //! Kept free of any Wayland/portal dependency so it's trivially
 //! unit-testable and reusable independently of the GUI.
@@ -333,6 +333,59 @@ pub fn contrast_ratio(a: Rgb, b: Rgb) -> f64 {
     (lighter + 0.05) / (darker + 0.05)
 }
 
+/// APCA lightness contrast (Lc) of `text` on `bg`, roughly -108 to 106.
+///
+/// Port of `APCAcontrast(sRGBtoY(text), sRGBtoY(bg))` from the reference
+/// implementation, `apca-w3` 0.1.9 (APCA 0.0.98G-4g constants),
+/// checked against its own test values below.
+///
+/// Unlike the WCAG ratio, the order matters: APCA models text and its
+/// background differently, and the sign gives the polarity — positive
+/// for dark text on a light background, negative for light on dark. The
+/// level thresholds apply to the magnitude.
+pub fn apca_contrast(text: Rgb, bg: Rgb) -> f64 {
+    const BLK_THRS: f64 = 0.022;
+    const BLK_CLMP: f64 = 1.414;
+    const DELTA_Y_MIN: f64 = 0.0005;
+    const LO_CLIP: f64 = 0.1;
+    const SCALE: f64 = 1.14;
+    const LO_OFFSET: f64 = 0.027;
+
+    // Soft clamp toward black: APCA's model of flare and how little the
+    // eye distinguishes among near-blacks.
+    let soft_clamp = |y: f64| {
+        if y > BLK_THRS { y } else { y + (BLK_THRS - y).powf(BLK_CLMP) }
+    };
+    let txt = soft_clamp(text.apca_y());
+    let bg = soft_clamp(bg.apca_y());
+
+    if (bg - txt).abs() < DELTA_Y_MIN {
+        return 0.0;
+    }
+    let lc = if bg > txt {
+        // Normal polarity: dark text on light.
+        let sapc = (bg.powf(0.56) - txt.powf(0.57)) * SCALE;
+        if sapc < LO_CLIP { 0.0 } else { sapc - LO_OFFSET }
+    } else {
+        // Reverse polarity: light text on dark.
+        let sapc = (bg.powf(0.65) - txt.powf(0.62)) * SCALE;
+        if sapc > -LO_CLIP { 0.0 } else { sapc + LO_OFFSET }
+    };
+    lc * 100.0
+}
+
+impl Rgb {
+    /// APCA's screen luminance estimate. Deliberately *not*
+    /// [`Self::relative_luminance`]: APCA uses a plain 2.4 power curve
+    /// (no linear toe) and slightly different coefficients, to model a
+    /// real monitor rather than the sRGB spec. Mixing the two up shifts
+    /// Lc by several points on dark colors.
+    fn apca_y(self) -> f64 {
+        let ch = |c: u8| (c as f64 / 255.0).powf(2.4);
+        0.2126729 * ch(self.r) + 0.7151522 * ch(self.g) + 0.0721750 * ch(self.b)
+    }
+}
+
 fn srgb_to_linear(c: f64) -> f64 {
     if c <= 0.04045 {
         c / 12.92
@@ -486,6 +539,31 @@ mod tests {
     fn from_unit_floats_matches_portal_range() {
         let c = Rgb::from_unit_floats(1.0, 0.0, 0.5019607843137255);
         assert_eq!(c, Rgb::new(255, 0, 128));
+    }
+
+    /// The reference implementation's own test pairs (apca-w3 0.1.9,
+    /// `test/index.js`), text first.
+    #[test]
+    fn apca_matches_reference() {
+        let hex = |s: &str| {
+            let s = s.trim_start_matches('#');
+            let d: Vec<u8> = s.bytes().map(|b| (b as char).to_digit(16).unwrap() as u8 * 17).collect();
+            Rgb::new(d[0], d[1], d[2])
+        };
+        for (txt, bg, want) in [
+            ("#888", "#fff", 63.056469930209424),
+            ("#fff", "#888", -68.54146436644962),
+            ("#000", "#aaa", 58.146262578561334),
+            ("#aaa", "#000", -56.24113336839742),
+            ("#123", "#def", 91.66830811481631),
+            ("#def", "#123", -93.06770049484275),
+            ("#123", "#444", 8.32326136957393),
+            ("#444", "#123", -7.526878460278154),
+        ] {
+            let got = apca_contrast(hex(txt), hex(bg));
+            assert!((got - want).abs() < 1e-9, "{txt} on {bg}: {got} != {want}");
+        }
+        assert_eq!(apca_contrast(Rgb::new(9, 9, 9), Rgb::new(9, 9, 9)), 0.0);
     }
 
     // --- HSL ---

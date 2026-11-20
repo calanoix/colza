@@ -3,9 +3,10 @@
 //!
 //! - a 36px toolbar-style header (brand name, light/dark toggle at the right);
 //! - a body split by a 1px vertical line (like flax's sidebar border):
-//!   - left (white, full height): contrast preview, ratio, the WCAG
-//!     criteria as pass/fail tags, and a "swap foreground & background"
-//!     button;
+//!   - left (white, full height): a WCAG 2.x / APCA segmented control
+//!     with a "swap foreground & background" icon button beside it,
+//!     contrast preview, ratio or Lc, and the method's levels as
+//!     pass/fail tags;
 //!   - right (grey): Foreground and Background "cards", each as tall as
 //!     its content (format dropdown, swatch, text field, eyedropper,
 //!     three sliders for the chosen format's model — R/G/B, H/S/L or
@@ -118,11 +119,13 @@ const CARD_MARGIN: f32 = 16.0;
 /// (flax: the sidebar, separated from the detail pane by a 1px line).
 const LEFT_WIDTH: f32 = 260.0;
 /// Fixed window size (the window is not resizable). The height fits the
-/// tallest section (the left one, with the swap button under the criteria).
+/// tallest section: header (36) + a color card (318) + its 16px margins
+/// above and below. The left section is shorter (~290 of content) since
+/// the swap button moved into its header row.
 /// The width is set by the longest text the color field must show whole:
 /// an OkLCh value like `oklch(56.36% 0.29123 302.15)` measures ~163px in
 /// Roboto 12px, and at 840px wide the field only had 140px of text area.
-const WINDOW_SIZE: [f32; 2] = [896.0, 416.0];
+const WINDOW_SIZE: [f32; 2] = [896.0, 386.0];
 /// Extra vertical space between two sliders (on top of the card's spacing).
 const SLIDER_GAP: f32 = 6.0;
 /// Space between the vertical line and the color cards.
@@ -365,6 +368,20 @@ fn blend(top: Rgb, alpha: u8, under: Rgb) -> Rgb {
     let a = alpha as f32 / 255.0;
     let mix = |t: u8, u: u8| (t as f32 * a + u as f32 * (1.0 - a)).round() as u8;
     Rgb::new(mix(top.r, under.r), mix(top.g, under.g), mix(top.b, under.b))
+}
+
+/// APCA Lc as shown: the magnitude, truncated (never rounded up) to one
+/// decimal, for the same reason as [`format_ratio`] — an Lc of 74.96
+/// fails "75+", so it must not read "75".
+///
+/// APCA's raw value is signed (negative = light text on dark), but the
+/// sign only encodes polarity, which the "Aa" preview already shows, and
+/// the levels apply to the magnitude. Shown next to "Lc 75+" thresholds,
+/// "Lc -80" reads as failing when it passes, and swapping the colors
+/// would flip it for no visible reason.
+fn format_lc(lc: f64) -> String {
+    let truncated = (lc.abs() * 10.0 + 1e-6).floor() / 10.0;
+    format!("Lc {}", fmt_num(truncated, 1))
 }
 
 /// Ratio as shown to the user: truncated (never rounded up) to two
@@ -703,6 +720,144 @@ fn tag(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
         .galley(rect.center() - galley.size() / 2.0, galley, fg);
 }
 
+/// Segmented control: a grey track holding one segment per option, the
+/// selected one raised (card background, dark outline, bold text).
+/// Returns true if the selection changed.
+///
+/// Built as a radio group for assistive tech, since that's what it is:
+/// each segment reports itself as a radio button with its checked state,
+/// named "`group`: option" because egui has no group container to carry
+/// the group's name. Keyboard follows the ARIA radio-group pattern as far
+/// as egui allows: arrows move the selection *and* focus to the
+/// neighboring segment (wrapping), Space/Enter select the focused one.
+/// (ARIA would also take unselected segments out of the Tab order; egui
+/// has no way to make a clickable widget unfocusable, so Tab visits both.)
+fn segmented_control<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    group: &str,
+    value: &mut T,
+    options: &[(T, &str)],
+) -> bool {
+    const HEIGHT: f32 = 26.0;
+    const PAD_X: f32 = 10.0;
+    const INSET: f32 = 2.0;
+    const RADIUS: f32 = 6.0;
+
+    // Every segment is sized for its *bold* label, so the control doesn't
+    // change width as the bold moves with the selection.
+    let font = |selected: bool| {
+        if selected {
+            egui::FontId::new(12.0, bold())
+        } else {
+            egui::FontId::proportional(12.0)
+        }
+    };
+    let widths: Vec<f32> = options
+        .iter()
+        .map(|(_, label)| {
+            let g = ui.painter().layout_no_wrap((*label).to_owned(), font(true), p.text);
+            g.size().x + 2.0 * PAD_X
+        })
+        .collect();
+    let total = widths.iter().sum::<f32>() + 2.0 * INSET;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(total, HEIGHT), egui::Sense::hover());
+
+    ui.painter().rect_filled(rect, RADIUS, p.toolbar_bg);
+    ui.painter().rect_stroke(
+        rect,
+        RADIUS,
+        egui::Stroke::new(1.0_f32, p.border),
+        egui::StrokeKind::Inside,
+    );
+
+    let base_id = ui.id().with(("segmented", group));
+    let ids: Vec<egui::Id> = (0..options.len()).map(|i| base_id.with(i)).collect();
+    let mut selected = options.iter().position(|(v, _)| v == value);
+    let before = selected;
+    let mut x = rect.left() + INSET;
+
+    for (i, ((_, label), w)) in options.iter().zip(&widths).enumerate() {
+        let seg = egui::Rect::from_min_size(
+            egui::pos2(x, rect.top() + INSET),
+            egui::vec2(*w, HEIGHT - 2.0 * INSET),
+        );
+        x += w;
+        let resp = ui.interact(seg, ids[i], egui::Sense::click());
+        let is_selected = selected == Some(i);
+        let name = format!("{group}: {label}");
+        resp.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, is_selected, name.clone())
+        });
+
+        if resp.clicked() {
+            selected = Some(i);
+        }
+        if resp.has_focus() {
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    resp.id,
+                    egui::EventFilter { horizontal_arrows: true, ..Default::default() },
+                )
+            });
+            // Only reads input inside the closure (see magnifier.rs on
+            // egui's input lock); focus moves after it returns.
+            let step: isize = ui.input_mut(|inp| {
+                let mut d = 0;
+                if inp.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+                    d -= 1;
+                }
+                if inp.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+                    d += 1;
+                }
+                d
+            });
+            if step != 0 {
+                let n = options.len() as isize;
+                let j = (i as isize + step).rem_euclid(n) as usize;
+                selected = Some(j);
+                ui.memory_mut(|m| m.request_focus(ids[j]));
+            }
+        }
+
+        // Drawn with this frame's selection, so a click shows at once.
+        let shown_selected = selected == Some(i);
+        if shown_selected {
+            ui.painter().rect_filled(seg, RADIUS - 1.0, p.bg);
+            ui.painter().rect_stroke(
+                seg,
+                RADIUS - 1.0,
+                egui::Stroke::new(1.5_f32, p.text),
+                egui::StrokeKind::Inside,
+            );
+        } else if resp.hovered() {
+            ui.painter().rect_filled(seg, RADIUS - 1.0, ICON_HOVER);
+        }
+        let color = if shown_selected || resp.hovered() { p.text } else { p.text_secondary };
+        let galley = ui
+            .painter()
+            .layout_no_wrap((*label).to_owned(), font(shown_selected), color);
+        ui.painter()
+            .galley(seg.center() - galley.size() / 2.0, galley, color);
+        if resp.has_focus() {
+            ui.painter().rect_stroke(
+                seg,
+                RADIUS - 1.0,
+                egui::Stroke::new(2.0, p.focus),
+                egui::StrokeKind::Outside,
+            );
+        }
+    }
+
+    match selected {
+        Some(i) if selected != before => {
+            *value = options[i].0;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Card title row (flax's `.settings-card-title`): bold 14px title on the
 /// left, optional trailing content on the right, then a divider.
 fn card_title(
@@ -995,12 +1150,40 @@ impl ColorRowState {
     }
 }
 
-/// One WCAG criterion row.
+/// Which contrast method the left section evaluates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Method {
+    Wcag2,
+    Apca,
+}
+
+impl Method {
+    fn criteria(self) -> &'static [Criterion; 5] {
+        match self {
+            Self::Wcag2 => &CRITERIA,
+            Self::Apca => &APCA_CRITERIA,
+        }
+    }
+}
+
+/// One criterion row: a WCAG ratio or an APCA Lc level.
 struct Criterion {
     ratio_text: &'static str,
     label: &'static str,
+    /// Compared against the ratio (WCAG) or |Lc| (APCA).
     threshold: f64,
 }
+
+/// APCA's simplified ("bronze") use levels. They're minimums by use
+/// case; APCA's full guidance also ties each level to font size and
+/// weight, which this summary doesn't attempt.
+const APCA_CRITERIA: [Criterion; 5] = [
+    Criterion { ratio_text: "Lc 30", label: "Non-essential text", threshold: 30.0 },
+    Criterion { ratio_text: "Lc 45", label: "Larger text, non-text UI", threshold: 45.0 },
+    Criterion { ratio_text: "Lc 60", label: "Large / bold text", threshold: 60.0 },
+    Criterion { ratio_text: "Lc 75", label: "Body text", threshold: 75.0 },
+    Criterion { ratio_text: "Lc 90", label: "Preferred body text", threshold: 90.0 },
+];
 
 const CRITERIA: [Criterion; 5] = [
     Criterion { ratio_text: "3:1", label: "UI (AA)", threshold: 3.0 },
@@ -1012,6 +1195,7 @@ const CRITERIA: [Criterion; 5] = [
 
 struct App {
     mode: Mode,
+    method: Method,
     bg: ColorRowState,
     fg: ColorRowState,
 }
@@ -1020,6 +1204,7 @@ impl Default for App {
     fn default() -> Self {
         Self {
             mode: Mode::Normal,
+            method: Method::Wcag2,
             bg: ColorRowState::new("Background", Rgb::new(0xFF, 0xFF, 0xFF)),
             fg: ColorRowState::new("Foreground", Rgb::new(0x00, 0x00, 0x00)),
         }
@@ -1118,52 +1303,25 @@ impl App {
         toggled
     }
 
-    /// Full-width "swap" button for the left section: swap icon + text,
-    /// bordered like the text fields. Returns true when activated by
-    /// pointer or keyboard.
+    /// Icon-only "swap" button for the summary's header row, frameless
+    /// like the eyedropper and theme toggle. With no visible text, its
+    /// name reaches assistive tech through `widget_info` and sighted
+    /// users through the tooltip. Returns true when activated by pointer
+    /// or keyboard.
     fn swap_button(ui: &mut egui::Ui, p: &Palette) -> bool {
         const LABEL: &str = "Swap foreground & background";
-        const ICON: f32 = 20.0;
-        const GAP: f32 = 8.0;
+        // Same height as the segmented control beside it.
+        const SIZE: f32 = 26.0;
 
-        let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), CONTROL_SIZE),
-            egui::Sense::click(),
-        );
-        resp.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, LABEL)
-        });
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(SIZE, SIZE), egui::Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, LABEL));
 
         if resp.hovered() {
-            ui.painter().rect_filled(rect, 6.0, p.toolbar_bg);
+            ui.painter().rect_filled(rect, 6.0, ICON_HOVER);
         }
-        let border = if resp.hovered() { p.text_secondary } else { p.border };
-        ui.painter().rect_stroke(
-            rect,
-            6.0,
-            egui::Stroke::new(1.0_f32, border),
-            egui::StrokeKind::Inside,
-        );
-
-        // Icon + text, centered as a group.
-        let galley = ui.painter().layout_no_wrap(
-            LABEL.to_owned(),
-            egui::FontId::proportional(12.0),
-            p.text,
-        );
-        let group_w = ICON + GAP + galley.size().x;
-        let x0 = rect.center().x - group_w / 2.0;
-        let icon_rect = egui::Rect::from_center_size(
-            egui::pos2(x0 + ICON / 2.0, rect.center().y),
-            egui::vec2(ICON, ICON),
-        );
-        paint_swap(ui.painter(), icon_rect, p.text_secondary);
-        ui.painter().galley(
-            egui::pos2(x0 + ICON + GAP, rect.center().y - galley.size().y / 2.0),
-            galley,
-            p.text,
-        );
-
+        let color = if resp.hovered() { p.text } else { p.text_secondary };
+        paint_swap(ui.painter(), rect, color);
         if resp.has_focus() {
             ui.painter().rect_stroke(
                 rect,
@@ -1173,7 +1331,7 @@ impl App {
             );
         }
 
-        resp.clicked()
+        resp.on_hover_text(LABEL).clicked()
     }
 
     /// Light/dark toggle (header, top right). Shows the icon of the mode it
@@ -1210,16 +1368,49 @@ impl App {
         resp.on_hover_text(label).clicked()
     }
 
-    /// Left section: "Aa" preview + ratio, then the criteria as pass/fail tags.
-    fn draw_summary(ui: &mut egui::Ui, p: &Palette, bg: Rgb, fg: Rgb, ratio: f64) {
-        let passed = CRITERIA.iter().filter(|c| ratio >= c.threshold).count();
-        card_title(ui, p, "WCAG 2.X", |ui| {
-            ui.label(
-                egui::RichText::new(format!("{passed}/{} passed", CRITERIA.len()))
-                    .size(11.0)
-                    .color(p.text_secondary),
+    /// Left section: method switch and swap button, "Aa" preview + ratio
+    /// or Lc, then the method's criteria as pass/fail tags. Returns true
+    /// when the swap button was activated.
+    fn draw_summary(
+        ui: &mut egui::Ui,
+        p: &Palette,
+        bg: Rgb,
+        fg: Rgb,
+        method: &mut Method,
+    ) -> bool {
+        // Header row: the switch, then the swap button at the right. The
+        // score is computed after the switch has had its say, so a click
+        // shows the new method's numbers in that same frame. (A swap is
+        // applied by the caller after this frame's layout, like before.)
+        let mut big = String::new();
+        let mut score = 0.0;
+        let mut swap = false;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().interact_size.y = 24.0;
+            segmented_control(
+                ui,
+                p,
+                "Contrast method",
+                method,
+                &[(Method::Wcag2, "WCAG 2.x"), (Method::Apca, "APCA")],
             );
+            (score, big) = match *method {
+                Method::Wcag2 => {
+                    let ratio = crate::color::contrast_ratio(fg, bg);
+                    (ratio, format!("{}:1", format_ratio(ratio)))
+                }
+                // Foreground is the text: APCA is order-dependent.
+                Method::Apca => {
+                    let lc = crate::color::apca_contrast(fg, bg);
+                    (lc.abs(), format_lc(lc))
+                }
+            };
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                swap = Self::swap_button(ui, p);
+            });
         });
+        ui.add(egui::Separator::default().spacing(6.0));
+        let criteria = method.criteria();
 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
@@ -1239,7 +1430,7 @@ impl App {
                 color32(fg),
             );
             ui.label(
-                egui::RichText::new(format!("{}:1", format_ratio(ratio)))
+                egui::RichText::new(big)
                     .size(32.0)
                     .family(bold())
                     .color(p.text),
@@ -1248,12 +1439,14 @@ impl App {
 
         ui.add_space(4.0);
 
-        for (i, c) in CRITERIA.iter().enumerate() {
+        for (i, c) in criteria.iter().enumerate() {
             if i > 0 {
                 ui.add(egui::Separator::default().spacing(2.0));
             }
-            Self::criterion_row(ui, p, ratio >= c.threshold, c);
+            Self::criterion_row(ui, p, score >= c.threshold, c);
         }
+
+        swap
     }
 
     fn criterion_row(ui: &mut egui::Ui, p: &Palette, pass: bool, c: &Criterion) {
@@ -1301,7 +1494,7 @@ impl eframe::App for App {
         let mut swap_requested = false;
 
         let (bg_eff, fg_eff) = self.effective();
-        let ratio = crate::color::contrast_ratio(fg_eff, bg_eff);
+        let method = &mut self.method;
 
         let dark = ui.visuals().dark_mode;
         let mut toggle_theme = false;
@@ -1338,9 +1531,7 @@ impl eframe::App for App {
                             .layout(top_down),
                         |ui| {
                             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                            Self::draw_summary(ui, &p, bg_eff, fg_eff, ratio);
-                            ui.add_space(20.0);
-                            if Self::swap_button(ui, &p) {
+                            if Self::draw_summary(ui, &p, bg_eff, fg_eff, method) {
                                 swap_requested = true;
                             }
                         },
@@ -1604,6 +1795,15 @@ pub fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lc_is_truncated_toward_zero() {
+        assert_eq!(format_lc(74.96), "Lc 74.9"); // fails 75+, must not read 75
+        assert_eq!(format_lc(-68.54146), "Lc 68.5"); // light on dark
+        assert_eq!(format_lc(-74.96), "Lc 74.9");
+        assert_eq!(format_lc(63.0), "Lc 63");
+        assert_eq!(format_lc(0.0), "Lc 0");
+    }
 
     #[test]
     fn parse_color_accepts_every_format() {
