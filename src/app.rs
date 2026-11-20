@@ -1,13 +1,20 @@
-//! Main GUI, laid out in three columns:
+//! Main GUI, styled to match the flax extension (same palette, radii,
+//! spacing and type scale as `panel.css`, light and dark):
 //!
-//! - left: preview ("Aa" + contrast ratio) and the WCAG criteria list;
-//! - middle: Foreground (format dropdown, swatch, text field, eyedropper,
-//!   R/G/B/Alpha sliders);
-//! - right: the same for Background, with a swap button between the two
-//!   color columns.
+//! - a 36px toolbar-style header (brand name, light/dark toggle at the right);
+//! - a body split by a 1px vertical line (like flax's sidebar border):
+//!   - left (white, full height): contrast preview, ratio, the WCAG
+//!     criteria as pass/fail tags, and a "swap foreground & background"
+//!     button;
+//!   - right (grey): Foreground and Background "cards", each as tall as
+//!     its content (format dropdown, swatch, text field, eyedropper,
+//!     R/G/B/Alpha sliders with gradient rails and value readouts).
 //!
 //! Picking a color opens the magnifier as a second egui viewport so the
 //! main window stays visible while the loupe is up.
+//!
+//! The theme follows the system (light/dark) until the toggle is used.
+//! The window has a fixed size (`WINDOW_SIZE`).
 //!
 //! Fonts: Roboto Regular and Roboto Bold are embedded from `assets/`.
 //!
@@ -22,17 +29,101 @@ use crate::color::Rgb;
 use crate::magnifier::MagnifierState;
 use crate::screencast::ScreenSource;
 
-const MUTED: egui::Color32 = egui::Color32::from_gray(0x55);
-const INK: egui::Color32 = egui::Color32::from_gray(0x11);
-const PANEL_GRAY: egui::Color32 = egui::Color32::from_rgb(0xF1, 0xF2, 0xF4);
-const FAIL_RED: egui::Color32 = egui::Color32::from_rgb(0xB4, 0x2B, 0x0A);
-const FOCUS_BLUE: egui::Color32 = egui::Color32::from_rgb(0x1A, 0x73, 0xE8);
+/// Colors shared with flax's `panel.css` (`:root` for light,
+/// `prefers-color-scheme: dark` / `html.theme-dark` for dark).
+#[derive(Clone, Copy)]
+struct Palette {
+    /// `--bg-color`: cards, text fields.
+    bg: egui::Color32,
+    /// `--toolbar-bg`: header and window body.
+    toolbar_bg: egui::Color32,
+    /// `--border-color`.
+    border: egui::Color32,
+    /// `--accent-color`.
+    accent: egui::Color32,
+    /// `--accent-bg`.
+    accent_bg: egui::Color32,
+    /// `--text-primary`.
+    text: egui::Color32,
+    /// `--text-secondary`.
+    text_secondary: egui::Color32,
+    /// `--focus-color`.
+    focus: egui::Color32,
+    /// `.best-practice-tag` colors (swapped in dark mode, as in flax).
+    tag_fg: egui::Color32,
+    tag_bg: egui::Color32,
+    /// `--link-color`.
+    link: egui::Color32,
+}
 
-/// Size of the swap button, and of the slot reserved for it between the
-/// two color columns.
-const SWAP_SIZE: f32 = 38.0;
+impl Palette {
+    const fn light() -> Self {
+        Self {
+            bg: egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            toolbar_bg: egui::Color32::from_rgb(0xF1, 0xF3, 0xF4),
+            border: egui::Color32::from_rgb(0xE0, 0xE0, 0xE0),
+            accent: egui::Color32::from_rgb(0x3E, 0x47, 0xFF),
+            accent_bg: egui::Color32::from_rgb(0xEA, 0xEE, 0xFF),
+            text: egui::Color32::from_rgb(0x20, 0x21, 0x24),
+            text_secondary: egui::Color32::from_rgb(0x5F, 0x63, 0x68),
+            focus: egui::Color32::from_rgb(0x00, 0x00, 0x00),
+            tag_fg: egui::Color32::from_rgb(0x3E, 0x47, 0xFF),
+            tag_bg: egui::Color32::from_rgb(0xEA, 0xEE, 0xFF),
+            link: egui::Color32::from_rgb(0x19, 0x67, 0xD2),
+        }
+    }
+
+    const fn dark() -> Self {
+        Self {
+            bg: egui::Color32::from_rgb(0x20, 0x21, 0x24),
+            toolbar_bg: egui::Color32::from_rgb(0x29, 0x2A, 0x2D),
+            border: egui::Color32::from_rgb(0x3C, 0x40, 0x43),
+            accent: egui::Color32::from_rgb(0xEA, 0xEE, 0xFF),
+            accent_bg: egui::Color32::from_rgb(0x3E, 0x47, 0xFF),
+            text: egui::Color32::from_rgb(0xE8, 0xEA, 0xED),
+            text_secondary: egui::Color32::from_rgb(0x9A, 0xA0, 0xA6),
+            focus: egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            tag_fg: egui::Color32::from_rgb(0x3E, 0x47, 0xFF),
+            tag_bg: egui::Color32::from_rgb(0xEA, 0xEE, 0xFF),
+            link: egui::Color32::from_rgb(0x8A, 0xB4, 0xFB),
+        }
+    }
+
+    const fn new(dark: bool) -> Self {
+        if dark {
+            Self::dark()
+        } else {
+            Self::light()
+        }
+    }
+}
+
+/// Background of the "Fail" tag: flax's `--highlight` red in light mode,
+/// kept for both themes so white text on it stays above 4.5:1.
+const FAIL_BG: egui::Color32 = egui::Color32::from_rgb(0xD9, 0x30, 0x25);
+/// Neutral hover fill for icon-only buttons (flax: `rgba(128,128,128,.15)`).
+const ICON_HOVER: egui::Color32 = egui::Color32::from_rgba_premultiplied(19, 19, 19, 38);
+
 /// Horizontal gap between the layout columns.
-const COL_GAP: f32 = 24.0;
+const COL_GAP: f32 = 12.0;
+/// Height of the header toolbar (flax: 36px).
+const HEADER_HEIGHT: f32 = 36.0;
+/// Height of swatch, text field and icon buttons.
+const CONTROL_SIZE: f32 = 32.0;
+/// Card inner margin (flax: 16px) and border width.
+const CARD_MARGIN: f32 = 16.0;
+/// Width of the left "contrast" section, including its right border
+/// (flax: the sidebar, separated from the detail pane by a 1px line).
+const LEFT_WIDTH: f32 = 260.0;
+/// Fixed window size (the window is not resizable). The height fits the
+/// tallest section (the left one, with the swap button under the criteria).
+const WINDOW_SIZE: [f32; 2] = [840.0, 416.0];
+/// Extra vertical space between two sliders (on top of the card's spacing).
+const SLIDER_GAP: f32 = 6.0;
+/// Space between the vertical line and the color cards.
+const RIGHT_PAD_LEFT: f32 = 28.0;
+/// Size of the theme toggle in the header.
+const TOGGLE_SIZE: f32 = 28.0;
 
 /// Stable id for the magnifier's viewport, so the same native window can be
 /// referred to across frames (opened once, updated, then closed).
@@ -139,91 +230,133 @@ fn format_ratio(ratio: f64) -> String {
     s.trim_end_matches('0').trim_end_matches('.').to_owned()
 }
 
-/// Round-handle slider painted by hand (black rail, white handle), with
-/// pointer + keyboard support (arrows ±1, Shift+arrows ±10) and an
-/// accessible name/value. Returns true if `value` changed.
-fn channel_slider(ui: &mut egui::Ui, name: &str, a11y_prefix: &str, value: &mut u8) -> bool {
-    const R: f32 = 12.0;
+fn color32(c: Rgb) -> egui::Color32 {
+    egui::Color32::from_rgb(c.r, c.g, c.b)
+}
 
-    ui.label(egui::RichText::new(name).size(16.0).color(MUTED));
-    let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 2.0 * R),
-        egui::Sense::click_and_drag(),
-    );
-    let label = format!("{a11y_prefix} {name}");
-    resp.widget_info(|| egui::WidgetInfo::slider(true, *value as f64, label.clone()));
+/// Round-handle slider painted by hand: a gradient rail from `track.0` to
+/// `track.1` (so the rail previews what the channel does), a handle with an
+/// accent outline, a value readout, and pointer + keyboard support (arrows
+/// ±1, Shift+arrows ±10) with an accessible name/value. Returns true if
+/// `value` changed.
+fn channel_slider(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    name: &str,
+    a11y_prefix: &str,
+    value: &mut u8,
+    track: (egui::Color32, egui::Color32),
+    as_percent: bool,
+) -> bool {
+    const R: f32 = 9.0;
 
-    let x0 = rect.left() + R;
-    let x1 = rect.right() - R;
-    let mut changed = false;
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
 
-    if resp.is_pointer_button_down_on() {
-        if let Some(pos) = resp.interact_pointer_pos() {
-            let t = ((pos.x - x0) / (x1 - x0)).clamp(0.0, 1.0);
-            let v = (t * 255.0).round() as u8;
-            if v != *value {
-                *value = v;
-                changed = true;
-            }
-        }
-    }
-
-    if resp.has_focus() {
-        // Keep egui from using the arrows to move focus to another widget.
-        ui.memory_mut(|m| {
-            m.set_focus_lock_filter(
-                resp.id,
-                egui::EventFilter {
-                    horizontal_arrows: true,
-                    vertical_arrows: true,
-                    ..Default::default()
-                },
-            )
+        // Name on the left, current value on the right.
+        let readout = if as_percent {
+            format!("{}%", (*value as f32 / 255.0 * 100.0).round() as u32)
+        } else {
+            value.to_string()
+        };
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(name).size(11.0).color(p.text_secondary));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new(readout).size(11.0).color(p.text));
+            });
         });
-        let delta: i32 = ui.input_mut(|i| {
-            let mut d = 0;
-            for (key, sign) in [
-                (egui::Key::ArrowLeft, -1),
-                (egui::Key::ArrowDown, -1),
-                (egui::Key::ArrowRight, 1),
-                (egui::Key::ArrowUp, 1),
-            ] {
-                if i.consume_key(egui::Modifiers::SHIFT, key) {
-                    d += 10 * sign;
-                } else if i.consume_key(egui::Modifiers::NONE, key) {
-                    d += sign;
+
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 2.0 * R),
+            egui::Sense::click_and_drag(),
+        );
+        let label = format!("{a11y_prefix} {name}");
+        resp.widget_info(|| egui::WidgetInfo::slider(true, *value as f64, label.clone()));
+
+        let x0 = rect.left() + R;
+        let x1 = rect.right() - R;
+        let mut changed = false;
+
+        if resp.is_pointer_button_down_on() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let t = ((pos.x - x0) / (x1 - x0)).clamp(0.0, 1.0);
+                let v = (t * 255.0).round() as u8;
+                if v != *value {
+                    *value = v;
+                    changed = true;
                 }
             }
-            d
-        });
-        if delta != 0 {
-            let v = (*value as i32 + delta).clamp(0, 255) as u8;
-            if v != *value {
-                *value = v;
-                changed = true;
+        }
+
+        if resp.has_focus() {
+            // Keep egui from using the arrows to move focus to another widget.
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    resp.id,
+                    egui::EventFilter {
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        ..Default::default()
+                    },
+                )
+            });
+            let delta: i32 = ui.input_mut(|i| {
+                let mut d = 0;
+                for (key, sign) in [
+                    (egui::Key::ArrowLeft, -1),
+                    (egui::Key::ArrowDown, -1),
+                    (egui::Key::ArrowRight, 1),
+                    (egui::Key::ArrowUp, 1),
+                ] {
+                    if i.consume_key(egui::Modifiers::SHIFT, key) {
+                        d += 10 * sign;
+                    } else if i.consume_key(egui::Modifiers::NONE, key) {
+                        d += sign;
+                    }
+                }
+                d
+            });
+            if delta != 0 {
+                let v = (*value as i32 + delta).clamp(0, 255) as u8;
+                if v != *value {
+                    *value = v;
+                    changed = true;
+                }
             }
         }
-    }
 
-    let painter = ui.painter();
-    let cy = rect.center().y;
-    let cx = x0 + (*value as f32 / 255.0) * (x1 - x0);
-    painter.rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(rect.left(), cy - 3.0),
-            egui::pos2(rect.right(), cy + 3.0),
-        ),
-        3.0,
-        INK,
-    );
-    let center = egui::pos2(cx, cy);
-    painter.circle_filled(center, R - 1.0, egui::Color32::WHITE);
-    painter.circle_stroke(center, R - 1.0, egui::Stroke::new(2.0, INK));
-    if resp.has_focus() {
-        painter.circle_stroke(center, R + 1.5, egui::Stroke::new(2.0, FOCUS_BLUE));
-    }
+        let painter = ui.painter();
+        let cy = rect.center().y;
+        let cx = x0 + (*value as f32 / 255.0) * (x1 - x0);
 
-    changed
+        // Gradient rail. It stops at the handle's travel limits, so its
+        // square ends are always hidden under the handle.
+        let rail = egui::Rect::from_min_max(egui::pos2(x0, cy - 3.0), egui::pos2(x1, cy + 3.0));
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(rail.left_top(), track.0);
+        mesh.colored_vertex(rail.right_top(), track.1);
+        mesh.colored_vertex(rail.right_bottom(), track.1);
+        mesh.colored_vertex(rail.left_bottom(), track.0);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(egui::Shape::mesh(mesh));
+        painter.rect_stroke(
+            rail,
+            0.0,
+            egui::Stroke::new(1.0_f32, p.text_secondary),
+            egui::StrokeKind::Outside,
+        );
+
+        let center = egui::pos2(cx, cy);
+        painter.circle_filled(center, R - 2.0, p.bg);
+        painter.circle_stroke(center, R - 2.0, egui::Stroke::new(2.0, p.accent));
+        if resp.has_focus() {
+            painter.circle_stroke(center, R + 1.0, egui::Stroke::new(2.0, p.focus));
+        }
+
+        changed
+    })
+    .inner
 }
 
 /// SVG path from `eye-dropper-solid-full.svg` (Font Awesome Free 7.3.1).
@@ -297,9 +430,9 @@ fn eyedropper_svg_polygons() -> Vec<Vec<egui::Pos2>> {
 }
 
 fn paint_eyedropper(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    // Render the SVG path at 20 px wide, centered inside the 38 x 38 px hit target.
+    // Render the SVG path 18 px wide, centered inside the hit target.
     // The visible path spans approximately 526 units in the 640 x 640 viewBox.
-    let scale = 20.0 / 526.0;
+    let scale = 18.0 / 526.0;
     let origin = rect.center() - egui::vec2(323.0 * scale, 315.0 * scale);
     for polygon in eyedropper_svg_polygons() {
         let points = polygon.into_iter()
@@ -317,10 +450,8 @@ fn paint_eyedropper(painter: &egui::Painter, rect: egui::Rect, color: egui::Colo
 /// A double arrow (⇄) drawn with strokes, like the eyedropper: no icon
 /// font needed.
 fn paint_swap(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    // Draw a 20 px icon centered in the larger clickable area.
     let c = rect.center();
-    let scale = 20.0 / 18.0;
-    let p = |x: f32, y: f32| c + egui::vec2(x * scale, y * scale);
+    let p = |x: f32, y: f32| c + egui::vec2(x, y);
     let s = egui::Stroke::new(2.0, color);
     // Top arrow, pointing right.
     painter.line_segment([p(-9.0, -4.0), p(9.0, -4.0)], s);
@@ -332,7 +463,132 @@ fn paint_swap(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     painter.line_segment([p(-5.0, 8.0), p(-9.0, 4.0)], s);
 }
 
-/// One color column: format dropdown, label, swatch + text + eyedropper,
+/// Sun icon (shown in dark mode: click to go light), drawn with strokes.
+fn paint_sun(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    painter.circle_filled(c, 4.5, color);
+    let stroke = egui::Stroke::new(2.0, color);
+    for i in 0..8 {
+        let a = i as f32 * std::f32::consts::FRAC_PI_4;
+        let dir = egui::vec2(a.cos(), a.sin());
+        painter.line_segment([c + dir * 7.5, c + dir * 10.0], stroke);
+    }
+}
+
+/// Crescent moon icon (shown in light mode: click to go dark). The
+/// crescent is the outer circle minus an offset inner circle; it is built
+/// as a triangle strip between the two arcs (egui can't fill concave paths
+/// reliably) plus a thin outline for smooth edges.
+fn paint_moon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    const R: f32 = 8.5; // outer radius
+    const INNER_R: f32 = 7.2; // inner (cut-out) radius
+    const STEPS: usize = 24;
+
+    let c = rect.center();
+    // The inner circle is offset toward the upper right.
+    let u = egui::vec2(0.8, -0.6);
+    let d = 6.0_f32;
+    let inner_c = c + u * d;
+
+    // The crescent's tips are where the two circles cross; `a` is the
+    // distance from the outer center to the chord joining them.
+    let a = (R * R - INNER_R * INNER_R + d * d) / (2.0 * d);
+    // Directions are measured from -u, the crescent's "thick" side.
+    let m = (-u.y).atan2(-u.x);
+    let phi = (-a / R).clamp(-1.0, 1.0).acos();
+    let psi = ((d - a) / INNER_R).clamp(-1.0, 1.0).acos();
+
+    let mut outer = Vec::with_capacity(STEPS + 1);
+    let mut inner = Vec::with_capacity(STEPS + 1);
+    for i in 0..=STEPS {
+        let t = i as f32 / STEPS as f32;
+        let ao = m - phi + 2.0 * phi * t;
+        let ai = m - psi + 2.0 * psi * t;
+        outer.push(c + egui::vec2(ao.cos(), ao.sin()) * R);
+        inner.push(inner_c + egui::vec2(ai.cos(), ai.sin()) * INNER_R);
+    }
+
+    let mut mesh = egui::Mesh::default();
+    for i in 0..=STEPS {
+        mesh.colored_vertex(outer[i], color);
+        mesh.colored_vertex(inner[i], color);
+    }
+    for i in 0..STEPS as u32 {
+        let o0 = 2 * i;
+        let i0 = 2 * i + 1;
+        let o1 = 2 * i + 2;
+        let i1 = 2 * i + 3;
+        mesh.add_triangle(o0, i0, o1);
+        mesh.add_triangle(i0, i1, o1);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+
+    let mut outline = outer;
+    outline.extend(inner.into_iter().rev());
+    painter.add(egui::Shape::closed_line(
+        outline,
+        egui::Stroke::new(1.0_f32, color),
+    ));
+}
+
+/// Small uppercase tag, like flax's `.best-practice-tag`. Exposes its
+/// text to screen readers.
+fn tag(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_uppercase(),
+        egui::FontId::new(9.0, bold()),
+        fg,
+    );
+    let size = galley.size() + egui::vec2(10.0, 4.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text));
+    ui.painter().rect_filled(rect, 3.0, bg);
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, fg);
+}
+
+/// Card title row (flax's `.settings-card-title`): bold 14px title on the
+/// left, optional trailing content on the right, then a divider.
+fn card_title(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    title: &str,
+    trailing: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().interact_size.y = 24.0;
+        ui.label(
+            egui::RichText::new(title)
+                .size(14.0)
+                .family(bold())
+                .color(p.text),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), trailing);
+    });
+    ui.add(egui::Separator::default().spacing(6.0));
+}
+
+/// A white, bordered, rounded card (flax's `.settings-card`). Its height
+/// follows its content; its width fills the column.
+fn card<R>(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    egui::Frame::new()
+        .fill(p.bg)
+        .stroke(egui::Stroke::new(1.0_f32, p.border))
+        .corner_radius(8.0)
+        .inner_margin(CARD_MARGIN)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+            add_contents(ui)
+        })
+        .inner
+}
+
+/// One color card: title + format dropdown, swatch + text + eyedropper,
 /// then R/G/B/Alpha sliders.
 struct ColorRowState {
     label: &'static str,
@@ -366,27 +622,37 @@ impl ColorRowState {
         self.sync_text();
     }
 
-    /// Draws the column and returns the vertical center (in screen
+    /// Draws the card contents and returns the vertical center (in screen
     /// coordinates) of the swatch/text/eyedropper row, so the caller can
     /// align the swap button with it.
-    fn ui(&mut self, ui: &mut egui::Ui, picking: bool, on_pick: impl FnOnce()) -> f32 {
-        // Compact format dropdown, transparent in every interaction state.
+    fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        picking: bool,
+        on_pick: impl FnOnce(),
+    ) -> f32 {
+        // Title + compact format dropdown.
         let before = self.format;
-        ui.scope(|ui| {
-            let visuals = &mut ui.style_mut().visuals;
-            for widget in [&mut visuals.widgets.inactive, &mut visuals.widgets.hovered, &mut visuals.widgets.active] {
-                // Keep the outline, but remove the grey fill.
-                widget.bg_fill = egui::Color32::TRANSPARENT;
-                widget.weak_bg_fill = egui::Color32::TRANSPARENT;
-            }
-            ui.spacing_mut().button_padding = egui::vec2(3.0, 2.0);
-            ui.spacing_mut().combo_width = 88.0;
-            egui::ComboBox::from_id_salt((self.label, "format"))
-                .width(88.0)
-                .selected_text(egui::RichText::new(self.format.name()).size(16.0).strong())
+        let label = self.label;
+        let format = &mut self.format;
+        card_title(ui, p, label, |ui| {
+            ui.spacing_mut().combo_width = 72.0;
+            egui::ComboBox::from_id_salt((label, "format"))
+                .width(72.0)
+                .selected_text(
+                    egui::RichText::new(format.name())
+                        .size(12.0)
+                        .family(bold())
+                        .color(p.text),
+                )
                 .show_ui(ui, |ui| {
                     for f in ColorFormat::ALL {
-                        ui.selectable_value(&mut self.format, f, f.name());
+                        ui.selectable_value(
+                            format,
+                            f,
+                            egui::RichText::new(f.name()).size(12.0),
+                        );
                     }
                 });
         });
@@ -394,16 +660,15 @@ impl ColorRowState {
             self.sync_text();
         }
 
-        ui.label(
-            egui::RichText::new(self.label)
-                .size(18.0)
-                .family(bold())
-                .color(MUTED),
-        );
-
         // Swatch + text field + eyedropper.
         let row = ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), egui::Sense::hover());
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.spacing_mut().interact_size.y = CONTROL_SIZE;
+
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(CONTROL_SIZE, CONTROL_SIZE),
+                egui::Sense::hover(),
+            );
             ui.painter().rect_filled(rect, 6.0, egui::Color32::WHITE);
             ui.painter().rect_filled(
                 rect,
@@ -418,15 +683,16 @@ impl ColorRowState {
             ui.painter().rect_stroke(
                 rect,
                 6.0,
-                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(0x88)),
+                egui::Stroke::new(1.0_f32, p.text_secondary),
                 egui::StrokeKind::Inside,
             );
 
             let field_width =
-                (ui.available_width() - 38.0 - ui.spacing().item_spacing.x).max(60.0);
+                (ui.available_width() - CONTROL_SIZE - ui.spacing().item_spacing.x).max(60.0);
             let field = ui.add(
                 egui::TextEdit::singleline(&mut self.text)
-                    .font(egui::FontId::proportional(16.0))
+                    .font(egui::FontId::proportional(12.0))
+                    .vertical_align(egui::Align::Center)
                     .desired_width(field_width),
             );
             if field.changed() {
@@ -443,25 +709,25 @@ impl ColorRowState {
             }
 
             // Frameless eyedropper: allocate the hit target directly so no
-            // button background can appear on hover, press, or focus.
+            // button background can appear on press or focus.
             let (icon_rect, btn) = ui.allocate_exact_size(
-                egui::vec2(38.0, 38.0),
+                egui::vec2(CONTROL_SIZE, CONTROL_SIZE),
                 if picking { egui::Sense::hover() } else { egui::Sense::click() },
             );
-            let icon_color = egui::Color32::from_rgb(0x5F, 0x63, 0x68);
             if btn.hovered() && !picking {
-                ui.painter().rect_filled(
-                    icon_rect,
-                    6.0,
-                    egui::Color32::from_rgb(0xF1, 0xF3, 0xF4),
-                );
+                ui.painter().rect_filled(icon_rect, 6.0, ICON_HOVER);
             }
+            let icon_color = if picking {
+                p.border
+            } else {
+                p.text_secondary
+            };
             paint_eyedropper(ui.painter(), icon_rect, icon_color);
             if btn.has_focus() {
                 ui.painter().rect_stroke(
                     icon_rect,
                     6.0,
-                    egui::Stroke::new(2.0, FOCUS_BLUE),
+                    egui::Stroke::new(2.0, p.focus),
                     egui::StrokeKind::Outside,
                 );
             }
@@ -474,15 +740,35 @@ impl ColorRowState {
             }
         });
 
-        // Sliders.
+        ui.add_space(4.0);
+
+        // Sliders: each rail previews the channel's range for the other
+        // two channels' current values.
+        let (r, g, b) = (self.color.r, self.color.g, self.color.b);
+        let c = egui::Color32::from_rgb;
         let mut changed = false;
-        changed |= channel_slider(ui, "Red", self.label, &mut self.color.r);
-        changed |= channel_slider(ui, "Green", self.label, &mut self.color.g);
-        changed |= channel_slider(ui, "Blue", self.label, &mut self.color.b);
+        changed |= channel_slider(
+            ui, p, "Red", self.label, &mut self.color.r,
+            (c(0, g, b), c(255, g, b)), false,
+        );
+        ui.add_space(SLIDER_GAP);
+        changed |= channel_slider(
+            ui, p, "Green", self.label, &mut self.color.g,
+            (c(r, 0, b), c(r, 255, b)), false,
+        );
+        ui.add_space(SLIDER_GAP);
+        changed |= channel_slider(
+            ui, p, "Blue", self.label, &mut self.color.b,
+            (c(r, g, 0), c(r, g, 255)), false,
+        );
         if changed {
             self.sync_text();
         }
-        channel_slider(ui, "Alpha", self.label, &mut self.alpha);
+        ui.add_space(SLIDER_GAP);
+        channel_slider(
+            ui, p, "Alpha", self.label, &mut self.alpha,
+            (p.bg, color32(self.color)), true,
+        );
 
         row.response.rect.center().y
     }
@@ -565,116 +851,205 @@ impl App {
         }
     }
 
-    /// Swap button, drawn by hand into `rect` (which sits in the gap
-    /// between the two color columns). Returns true when activated by
+    /// Header toolbar (flax's `.toolbar-brand`): 36px, toolbar background,
+    /// bottom border, brand name on the left and a muted subtitle on the
+    /// right (flax shows "WCAG 2.2 AA" there).
+    /// Returns true when the theme toggle (top right) was activated.
+    fn draw_header(ui: &mut egui::Ui, p: &Palette, dark: bool) -> bool {
+        let width = ui.available_width();
+        let rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(width, HEADER_HEIGHT));
+        ui.painter().rect_filled(rect, 0.0, p.toolbar_bg);
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom() - 0.5,
+            egui::Stroke::new(1.0_f32, p.border),
+        );
+
+        let mut toggled = false;
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, HEADER_HEIGHT),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.add_space(16.0);
+                ui.label(
+                    egui::RichText::new("colza")
+                        .size(12.0)
+                        .family(bold())
+                        .color(p.text),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(8.0);
+                    toggled = Self::theme_toggle(ui, p, dark);
+                });
+            },
+        );
+        toggled
+    }
+
+    /// Full-width "swap" button for the left section: swap icon + text,
+    /// bordered like the text fields. Returns true when activated by
     /// pointer or keyboard.
-    fn swap_button(ui: &mut egui::Ui, rect: egui::Rect) -> bool {
-        let resp = ui.interact(rect, ui.id().with("swap_colors"), egui::Sense::click());
+    fn swap_button(ui: &mut egui::Ui, p: &Palette) -> bool {
+        const LABEL: &str = "Swap foreground & background";
+        const ICON: f32 = 20.0;
+        const GAP: f32 = 8.0;
+
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), CONTROL_SIZE),
+            egui::Sense::click(),
+        );
         resp.widget_info(|| {
-            egui::WidgetInfo::labeled(
-                egui::WidgetType::Button,
-                true,
-                "Swap foreground and background colors",
-            )
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, LABEL)
         });
 
-        let icon_color = egui::Color32::from_rgb(0x5F, 0x63, 0x68);
         if resp.hovered() {
-            ui.painter().rect_filled(
-                rect,
-                6.0,
-                egui::Color32::from_rgb(0xF1, 0xF3, 0xF4),
-            );
+            ui.painter().rect_filled(rect, 6.0, p.toolbar_bg);
         }
-        paint_swap(ui.painter(), rect, icon_color);
+        let border = if resp.hovered() { p.text_secondary } else { p.border };
+        ui.painter().rect_stroke(
+            rect,
+            6.0,
+            egui::Stroke::new(1.0_f32, border),
+            egui::StrokeKind::Inside,
+        );
+
+        // Icon + text, centered as a group.
+        let galley = ui.painter().layout_no_wrap(
+            LABEL.to_owned(),
+            egui::FontId::proportional(12.0),
+            p.text,
+        );
+        let group_w = ICON + GAP + galley.size().x;
+        let x0 = rect.center().x - group_w / 2.0;
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(x0 + ICON / 2.0, rect.center().y),
+            egui::vec2(ICON, ICON),
+        );
+        paint_swap(ui.painter(), icon_rect, p.text_secondary);
+        ui.painter().galley(
+            egui::pos2(x0 + ICON + GAP, rect.center().y - galley.size().y / 2.0),
+            galley,
+            p.text,
+        );
+
         if resp.has_focus() {
             ui.painter().rect_stroke(
                 rect,
                 6.0,
-                egui::Stroke::new(2.0, FOCUS_BLUE),
+                egui::Stroke::new(2.0, p.focus),
                 egui::StrokeKind::Outside,
             );
         }
 
-        resp.on_hover_text("Swap colors").clicked()
+        resp.clicked()
     }
 
-    /// Left column: "Aa" preview + ratio, then the criteria box.
-    fn draw_summary(ui: &mut egui::Ui, bg: Rgb, fg: Rgb, ratio: f64) {
-        ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
-            ui.painter().rect_filled(rect, 6.0, egui::Color32::from_rgb(bg.r, bg.g, bg.b));
+    /// Light/dark toggle (header, top right). Shows the icon of the mode it
+    /// switches *to*. Returns true when activated by pointer or keyboard.
+    fn theme_toggle(ui: &mut egui::Ui, p: &Palette, dark: bool) -> bool {
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(TOGGLE_SIZE, TOGGLE_SIZE),
+            egui::Sense::click(),
+        );
+        let label = if dark {
+            "Switch to light mode"
+        } else {
+            "Switch to dark mode"
+        };
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+
+        if resp.hovered() {
+            ui.painter().rect_filled(rect, 6.0, ICON_HOVER);
+        }
+        if dark {
+            paint_sun(ui.painter(), rect, p.text_secondary);
+        } else {
+            paint_moon(ui.painter(), rect, p.text_secondary);
+        }
+        if resp.has_focus() {
             ui.painter().rect_stroke(
                 rect,
                 6.0,
-                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(0x88)),
+                egui::Stroke::new(2.0, p.focus),
+                egui::StrokeKind::Outside,
+            );
+        }
+
+        resp.on_hover_text(label).clicked()
+    }
+
+    /// Left section: "Aa" preview + ratio, then the criteria as pass/fail tags.
+    fn draw_summary(ui: &mut egui::Ui, p: &Palette, bg: Rgb, fg: Rgb, ratio: f64) {
+        let passed = CRITERIA.iter().filter(|c| ratio >= c.threshold).count();
+        card_title(ui, p, "WCAG 2.X", |ui| {
+            ui.label(
+                egui::RichText::new(format!("{passed}/{} passed", CRITERIA.len()))
+                    .size(11.0)
+                    .color(p.text_secondary),
+            );
+        });
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(48.0, 48.0), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 6.0, color32(bg));
+            ui.painter().rect_stroke(
+                rect,
+                6.0,
+                egui::Stroke::new(1.0_f32, p.text_secondary),
                 egui::StrokeKind::Inside,
             );
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "Aa",
-                egui::FontId::proportional(24.0),
-                egui::Color32::from_rgb(fg.r, fg.g, fg.b),
+                egui::FontId::new(22.0, bold()),
+                color32(fg),
             );
-            ui.add_space(8.0);
             ui.label(
                 egui::RichText::new(format!("{}:1", format_ratio(ratio)))
-                    .size(44.0)
-                    .strong()
-                    .color(INK),
+                    .size(32.0)
+                    .family(bold())
+                    .color(p.text),
             );
         });
 
-        ui.add_space(8.0);
+        ui.add_space(4.0);
 
-        egui::Frame::new()
-            .fill(PANEL_GRAY)
-            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_gray(0xDD)))
-            .corner_radius(10.0)
-            .inner_margin(16.0)
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                for c in &CRITERIA {
-                    Self::criterion_row(ui, ratio >= c.threshold, c);
-                }
-            });
+        for (i, c) in CRITERIA.iter().enumerate() {
+            if i > 0 {
+                ui.add(egui::Separator::default().spacing(2.0));
+            }
+            Self::criterion_row(ui, p, ratio >= c.threshold, c);
+        }
     }
 
-    fn criterion_row(ui: &mut egui::Ui, pass: bool, c: &Criterion) {
+    fn criterion_row(ui: &mut egui::Ui, p: &Palette, pass: bool, c: &Criterion) {
         ui.horizontal(|ui| {
-            // Pass/fail is conveyed by shape (check vs cross), not just
-            // color, and is also exposed as text to screen readers.
-            let (rect, resp) =
-                ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
-            resp.widget_info(|| {
-                egui::WidgetInfo::labeled(
-                    egui::WidgetType::Label,
-                    true,
-                    if pass { "Pass" } else { "Fail" },
-                )
-            });
-            let ctr = rect.center();
-            let p = |x: f32, y: f32| ctr + egui::vec2(x, y);
-            if pass {
-                ui.painter().add(egui::Shape::line(
-                    vec![p(-7.0, 0.0), p(-2.0, 6.0), p(7.0, -6.0)],
-                    egui::Stroke::new(2.5, INK),
-                ));
-            } else {
-                let s = egui::Stroke::new(2.5, FAIL_RED);
-                ui.painter().line_segment([p(-6.0, -6.0), p(6.0, 6.0)], s);
-                ui.painter().line_segment([p(-6.0, 6.0), p(6.0, -6.0)], s);
-            }
+            ui.spacing_mut().interact_size.y = 22.0;
 
             ui.allocate_ui_with_layout(
-                egui::vec2(52.0, 22.0),
+                egui::vec2(38.0, 22.0),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    ui.label(egui::RichText::new(c.ratio_text).size(16.0).color(MUTED));
+                    ui.label(
+                        egui::RichText::new(c.ratio_text)
+                            .size(11.0)
+                            .color(p.text_secondary),
+                    );
                 },
             );
-            ui.label(egui::RichText::new(c.label).size(16.0).color(MUTED));
+            ui.label(egui::RichText::new(c.label).size(12.0).color(p.text));
+
+            // Pass/fail is conveyed by text, not just color, and is also
+            // exposed to screen readers by `tag`.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if pass {
+                    tag(ui, "Pass", p.tag_fg, p.tag_bg);
+                } else {
+                    tag(ui, "Fail", egui::Color32::WHITE, FAIL_BG);
+                }
+            });
         });
     }
 }
@@ -688,6 +1063,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
 
+        let p = Palette::new(ui.visuals().dark_mode);
         let picking = !matches!(self.mode, Mode::Normal);
         let mut pick_target: Option<Target> = None;
         let mut swap_requested = false;
@@ -695,56 +1071,102 @@ impl eframe::App for App {
         let (bg_eff, fg_eff) = self.effective();
         let ratio = crate::color::contrast_ratio(fg_eff, bg_eff);
 
+        let dark = ui.visuals().dark_mode;
+        let mut toggle_theme = false;
+
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(egui::Color32::WHITE)
-                    .inner_margin(24.0),
-            )
+            .frame(egui::Frame::new().fill(p.toolbar_bg))
             .show(ui, |ui| {
-                let col_w =
-                    ((ui.available_width() - 3.0 * COL_GAP - SWAP_SIZE) / 3.0).max(0.0);
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+
+                toggle_theme = Self::draw_header(ui, &p, dark);
+
+                let body_h = ui.available_height();
+                let top_down = egui::Layout::top_down(egui::Align::Min);
 
                 ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = COL_GAP;
-                    let size = egui::vec2(col_w, ui.available_height());
-                    let layout = egui::Layout::top_down(egui::Align::Min);
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
-                    // Left: preview + criteria.
-                    ui.allocate_ui_with_layout(size, layout, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                        Self::draw_summary(ui, bg_eff, fg_eff, ratio);
-                    });
-
-                    // Middle: Foreground.
-                    let row_y = ui
-                        .allocate_ui_with_layout(size, layout, |ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                            self.fg
-                                .ui(ui, picking, || pick_target = Some(Target::Fg))
-                        })
-                        .inner;
-
-                    let (slot, _) = ui.allocate_exact_size(
-                        egui::vec2(SWAP_SIZE, 1.0),
+                    // Left: contrast section, full height, separated from
+                    // the colors by a vertical line (flax's sidebar border).
+                    let (left, _) = ui.allocate_exact_size(
+                        egui::vec2(LEFT_WIDTH, body_h),
                         egui::Sense::hover(),
                     );
-                    let btn_rect = egui::Rect::from_center_size(
-                        egui::pos2(slot.center().x, row_y),
-                        egui::vec2(SWAP_SIZE, SWAP_SIZE),
+                    ui.painter().rect_filled(left, 0.0, p.bg);
+                    ui.painter().vline(
+                        left.right() - 0.5,
+                        left.y_range(),
+                        egui::Stroke::new(1.0_f32, p.border),
                     );
-                    if Self::swap_button(ui, btn_rect) {
-                        swap_requested = true;
-                    }
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .id_salt("summary")
+                            .max_rect(left.shrink(CARD_MARGIN))
+                            .layout(top_down),
+                        |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                            Self::draw_summary(ui, &p, bg_eff, fg_eff, ratio);
+                            ui.add_space(20.0);
+                            if Self::swap_button(ui, &p) {
+                                swap_requested = true;
+                            }
+                        },
+                    );
 
-                    // Right: Background.
-                    ui.allocate_ui_with_layout(size, layout, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                        self.bg
-                            .ui(ui, picking, || pick_target = Some(Target::Bg));
-                    });
+                    // Right: the two color cards, each as tall as its
+                    // content, with extra room after the vertical line.
+                    let (right, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), body_h),
+                        egui::Sense::hover(),
+                    );
+                    let content = egui::Rect::from_min_max(
+                        right.min + egui::vec2(RIGHT_PAD_LEFT, CARD_MARGIN),
+                        right.max - egui::vec2(CARD_MARGIN, CARD_MARGIN),
+                    );
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .id_salt("colors")
+                            .max_rect(content)
+                            .layout(top_down),
+                        |ui| {
+                            let col_w = ((ui.available_width() - COL_GAP) / 2.0).max(0.0);
+                            let size = egui::vec2(col_w, ui.available_height());
+
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = COL_GAP;
+
+                                // Foreground.
+                                ui.allocate_ui_with_layout(size, top_down, |ui| {
+                                    card(ui, &p, |ui| {
+                                        self.fg.ui(ui, &p, picking, || {
+                                            pick_target = Some(Target::Fg)
+                                        });
+                                    });
+                                });
+
+                                // Background.
+                                ui.allocate_ui_with_layout(size, top_down, |ui| {
+                                    card(ui, &p, |ui| {
+                                        self.bg.ui(ui, &p, picking, || {
+                                            pick_target = Some(Target::Bg)
+                                        });
+                                    });
+                                });
+                            });
+                        },
+                    );
                 });
             });
+
+        if toggle_theme {
+            ctx.set_theme(if dark {
+                egui::Theme::Light
+            } else {
+                egui::Theme::Dark
+            });
+            ctx.request_repaint();
+        }
 
         if swap_requested {
             self.swap_colors();
@@ -869,24 +1291,68 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// egui visuals built from flax's palette. Widgets egui draws itself
+/// (text field, dropdown, popup, separators) pick up borders, radii and
+/// focus ring from here.
+fn visuals_for(dark: bool) -> egui::Visuals {
+    let p = Palette::new(dark);
+    let mut v = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+
+    v.panel_fill = p.toolbar_bg;
+    v.window_fill = p.bg;
+    v.window_stroke = egui::Stroke::new(1.0_f32, p.border);
+    v.window_corner_radius = egui::CornerRadius::same(8);
+    v.extreme_bg_color = p.bg; // text field background
+    v.faint_bg_color = p.toolbar_bg;
+    v.hyperlink_color = p.link;
+    v.selection.bg_fill = p.accent_bg;
+    // Text field focus ring: 2px in flax's focus color.
+    v.selection.stroke = egui::Stroke::new(2.0, p.focus);
+
+    // Separators use the noninteractive stroke.
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, p.border);
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, p.text);
+
+    let r = egui::CornerRadius::same(6);
+    for w in [
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.corner_radius = r;
+        w.bg_fill = p.bg;
+        w.weak_bg_fill = p.bg;
+        w.fg_stroke = egui::Stroke::new(1.0_f32, p.text);
+    }
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, p.border);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, p.text_secondary);
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, p.text_secondary);
+    v.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, p.text_secondary);
+    v.widgets.hovered.weak_bg_fill = p.toolbar_bg;
+    v.widgets.active.weak_bg_fill = p.toolbar_bg;
+    v.widgets.open.weak_bg_fill = p.toolbar_bg;
+
+    v
+}
+
+/// Registers both themes; egui picks the one matching the system.
 fn setup_style(ctx: &egui::Context) {
-    let mut v = egui::Visuals::light();
-    v.panel_fill = egui::Color32::WHITE;
-    v.extreme_bg_color = egui::Color32::WHITE;
-    let r = egui::CornerRadius::same(8);
-    v.widgets.inactive.corner_radius = r;
-    v.widgets.hovered.corner_radius = r;
-    v.widgets.active.corner_radius = r;
-    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(0xCC));
-    ctx.set_visuals(v);
+    ctx.set_visuals_of(egui::Theme::Light, visuals_for(false));
+    ctx.set_visuals_of(egui::Theme::Dark, visuals_for(true));
 }
 
 pub fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([820.0, 440.0])
-            .with_min_inner_size([740.0, 420.0]),
+            .with_inner_size(WINDOW_SIZE)
+            .with_resizable(false)
+            .with_maximize_button(false),
         ..Default::default()
     };
 
