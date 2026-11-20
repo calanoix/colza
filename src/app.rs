@@ -434,6 +434,17 @@ fn channel_slider(
         );
         let label = format!("{a11y_prefix} {}", channel.name);
         resp.widget_info(|| egui::WidgetInfo::slider(true, *value, label.clone()));
+        // `WidgetInfo::slider` only carries the raw number. The range lets
+        // a screen reader place it ("50%" of the way), the step matches
+        // the arrow keys, and the value text gives the units and notes the
+        // sighted readout shows — "210°", "0.258 · out of sRGB" — instead
+        // of a bare "210" or "0.258".
+        a11y(ui, resp.id, |node| {
+            node.set_min_numeric_value(0.0);
+            node.set_max_numeric_value(channel.max);
+            node.set_numeric_value_step(channel.step);
+            node.set_value(readout);
+        });
 
         let x0 = rect.left() + R;
         let x1 = rect.right() - R;
@@ -720,14 +731,37 @@ fn tag(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
         .galley(rect.center() - galley.size() / 2.0, galley, fg);
 }
 
+/// Edits the AccessKit node egui built for `id` this frame. Must run
+/// after the widget's own `widget_info` (which would overwrite it), and
+/// is a no-op when no assistive technology is listening (egui only
+/// builds the tree once one asks for it).
+fn a11y(ui: &egui::Ui, id: egui::Id, edit: impl FnOnce(&mut egui::accesskit::Node)) {
+    ui.ctx().accesskit_node_builder(id, edit);
+}
+
+/// Exposes a visible text label as a heading, so screen-reader users can
+/// jump between the window's sections (H / Shift+H in Orca and NVDA). egui
+/// never emits the heading role itself: `ui.heading()` only changes the
+/// font.
+///
+/// The name is set explicitly: egui puts a label's text in its *value*,
+/// which is where a label's name comes from, but not a heading's — left
+/// alone, it would be announced as "heading level 1" with no text.
+fn mark_heading(ui: &egui::Ui, id: egui::Id, level: usize, text: &str) {
+    a11y(ui, id, |node| {
+        node.set_role(egui::accesskit::Role::Heading);
+        node.set_level(level);
+        node.set_label(text);
+    });
+}
+
 /// Segmented control: a grey track holding one segment per option, the
 /// selected one raised (card background, dark outline, bold text).
 /// Returns true if the selection changed.
 ///
-/// Built as a radio group for assistive tech, since that's what it is:
-/// each segment reports itself as a radio button with its checked state,
-/// named "`group`: option" because egui has no group container to carry
-/// the group's name. Keyboard follows the ARIA radio-group pattern as far
+/// Built as a radio group for assistive tech, since that's what it is: a
+/// `RadioGroup` named `group`, containing one radio button per segment
+/// with its checked state. Keyboard follows the ARIA radio-group pattern as far
 /// as egui allows: arrows move the selection *and* focus to the
 /// neighboring segment (wrapping), Space/Enter select the focused one.
 /// (ARIA would also take unselected segments out of the Tab order; egui
@@ -761,6 +795,15 @@ fn segmented_control<T: Copy + PartialEq>(
         })
         .collect();
     let total = widths.iter().sum::<f32>() + 2.0 * INSET;
+
+    // The segments live in a child `Ui` so that its AccessKit node — the
+    // container egui makes for every `Ui` — can become the radio group
+    // they're announced as part of ("Contrast method, radio group").
+    ui.scope(|ui| {
+    a11y(ui, ui.unique_id(), |node| {
+        node.set_role(egui::accesskit::Role::RadioGroup);
+        node.set_label(group);
+    });
     let (rect, _) = ui.allocate_exact_size(egui::vec2(total, HEIGHT), egui::Sense::hover());
 
     ui.painter().rect_filled(rect, RADIUS, p.toolbar_bg);
@@ -785,9 +828,8 @@ fn segmented_control<T: Copy + PartialEq>(
         x += w;
         let resp = ui.interact(seg, ids[i], egui::Sense::click());
         let is_selected = selected == Some(i);
-        let name = format!("{group}: {label}");
         resp.widget_info(|| {
-            egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, is_selected, name.clone())
+            egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, is_selected, *label)
         });
 
         if resp.clicked() {
@@ -856,6 +898,8 @@ fn segmented_control<T: Copy + PartialEq>(
         }
         _ => false,
     }
+    })
+    .inner
 }
 
 /// Card title row (flax's `.settings-card-title`): bold 14px title on the
@@ -868,12 +912,14 @@ fn card_title(
 ) {
     ui.horizontal(|ui| {
         ui.spacing_mut().interact_size.y = 24.0;
-        ui.label(
+        let heading = ui.label(
             egui::RichText::new(title)
                 .size(14.0)
                 .family(bold())
                 .color(p.text),
         );
+        // Level 2, under the window's "colza" (level 1).
+        mark_heading(ui, heading.id, 2, title);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), trailing);
     });
     ui.add(egui::Separator::default().spacing(6.0));
@@ -1003,7 +1049,7 @@ impl ColorRowState {
         let format = &mut self.format;
         card_title(ui, p, label, |ui| {
             ui.spacing_mut().combo_width = 72.0;
-            egui::ComboBox::from_id_salt((label, "format"))
+            let combo = egui::ComboBox::from_id_salt((label, "format"))
                 .width(72.0)
                 .selected_text(
                     egui::RichText::new(format.name())
@@ -1020,6 +1066,35 @@ impl ColorRowState {
                         );
                     }
                 });
+            // No label is drawn next to the dropdown (the card title says
+            // whose it is), so it gets its name here; egui would otherwise
+            // announce only its value, "HEX".
+            let name = format!("{label} color format");
+            a11y(ui, combo.response.id, |node| node.set_label(name));
+
+            // Closed and focused, Up/Down step through the formats in
+            // place, like a native <select>; egui's ComboBox has no
+            // keyboard handling of its own besides opening. Left alone
+            // while the list is open (`inner` is `Some`): there egui's
+            // arrow navigation between the options is the right behavior.
+            if combo.response.has_focus() && combo.inner.is_none() {
+                let step: isize = ui.input_mut(|i| {
+                    let mut d = 0;
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                        d -= 1;
+                    }
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                        d += 1;
+                    }
+                    d
+                });
+                if step != 0 {
+                    let all = ColorFormat::ALL;
+                    let i = all.iter().position(|f| f == format).unwrap_or(0) as isize;
+                    // Clamped, not wrapped, as a native <select> does.
+                    *format = all[(i + step).clamp(0, all.len() as isize - 1) as usize];
+                }
+            }
         });
         if self.format != before {
             // Re-derived from the 8-bit color, so an out-of-gamut OkLCh
@@ -1062,6 +1137,9 @@ impl ColorRowState {
                     .vertical_align(egui::Align::Center)
                     .desired_width(field_width),
             );
+            // Named for the same reason as the dropdown: no visible label.
+            let name = format!("{} color value", self.label);
+            a11y(ui, field.id, |node| node.set_label(name));
             if field.changed() {
                 // Live-parse as the user types: update color if valid,
                 // leave the text alone either way. Text in the row's own
@@ -1288,12 +1366,13 @@ impl App {
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.add_space(16.0);
-                ui.label(
+                let title = ui.label(
                     egui::RichText::new("colza")
                         .size(12.0)
                         .family(bold())
                         .color(p.text),
                 );
+                mark_heading(ui, title.id, 1, "colza");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(8.0);
                     toggled = Self::theme_toggle(ui, p, dark);
@@ -1628,7 +1707,7 @@ impl eframe::App for App {
                 let mut picked_color = None;
 
                 if let Some(frame) = capture.take_frame() {
-                    state.screenshot = frame;
+                    state.accept_frame(frame);
                 }
 
                 ctx.show_viewport_immediate(
@@ -1641,7 +1720,12 @@ impl eframe::App for App {
                     |ui, _class| {
                         let ctx = ui.ctx().clone();
                         let ctx = &ctx;
-                        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                        // Hidden, because `MagnifierState::draw` paints its
+                        // own crosshair at `cursor_pos`. The system cursor
+                        // can't follow arrow-key nudges: Wayland doesn't let
+                        // clients move the pointer, so it would stay put
+                        // while the picked pixel moved away from it.
+                        ctx.set_cursor_icon(egui::CursorIcon::None);
 
                         let input = state.handle_input(ctx);
 
@@ -1677,7 +1761,41 @@ impl eframe::App for App {
                 ctx.request_repaint();
             }
         }
+
+        keep_arrows_off_focus(ctx);
     }
+}
+
+/// Stops the arrow keys from moving keyboard focus: only Tab and
+/// Shift+Tab do that here, as in a native desktop form.
+///
+/// egui moves focus to the nearest widget in the arrow's direction unless
+/// the focused widget claims the arrows through a focus-lock filter, and
+/// there is no global switch for it. So this gives that claim to whatever
+/// is focused, once per frame, after the widgets have drawn (the
+/// filter is read at the start of the next frame). Widgets that use
+/// arrows themselves — sliders, the segmented control, text fields,
+/// the format dropdown — still read them; buttons simply ignore them.
+///
+/// Skipped while a popup is open: inside the format dropdown's list,
+/// arrows moving between the options *is* the expected behavior.
+fn keep_arrows_off_focus(ctx: &egui::Context) {
+    if egui::Popup::is_any_open(ctx) {
+        return;
+    }
+    let Some(id) = ctx.memory(|m| m.focused()) else {
+        return;
+    };
+    ctx.memory_mut(|m| {
+        m.set_focus_lock_filter(
+            id,
+            egui::EventFilter {
+                horizontal_arrows: true,
+                vertical_arrows: true,
+                ..Default::default()
+            },
+        )
+    });
 }
 
 fn setup_fonts(ctx: &egui::Context) {
