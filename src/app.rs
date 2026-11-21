@@ -17,7 +17,10 @@
 //! main window stays visible while the loupe is up.
 //!
 //! The theme follows the system (light/dark) until the toggle is used.
-//! The window has a fixed size (`WINDOW_SIZE`).
+//! The window has a fixed size in points (`WINDOW_SIZE`), scaled as a
+//! whole by the zoom: the desktop's text size (`text_scale.rs`) times the
+//! user's own Ctrl+/Ctrl- zoom. The window is resized to match whenever
+//! the zoom changes, so nothing gets clipped.
 //!
 //! Fonts: Roboto Regular and Roboto Bold are embedded from `assets/`.
 //!
@@ -1276,6 +1279,14 @@ struct App {
     method: Method,
     bg: ColorRowState,
     fg: ColorRowState,
+    /// The desktop's text-size factor (`text_scale.rs`), 1.0 = default.
+    text_scale: f32,
+    /// Live updates to `text_scale` from the portal watcher.
+    text_scale_rx: std::sync::mpsc::Receiver<f32>,
+    /// The user's own zoom on top of `text_scale` (Ctrl+/Ctrl-/Ctrl+0).
+    user_zoom: f32,
+    /// The zoom the window was last sized for.
+    applied_zoom: f32,
 }
 
 impl Default for App {
@@ -1285,6 +1296,11 @@ impl Default for App {
             method: Method::Wcag2,
             bg: ColorRowState::new("Background", Rgb::new(0xFF, 0xFF, 0xFF)),
             fg: ColorRowState::new("Foreground", Rgb::new(0x00, 0x00, 0x00)),
+            text_scale: 1.0,
+            // A receiver whose sender is already gone: never yields.
+            text_scale_rx: std::sync::mpsc::channel().1,
+            user_zoom: 1.0,
+            applied_zoom: 1.0,
         }
     }
 }
@@ -1337,6 +1353,62 @@ impl App {
         }
 
         self.mode = Mode::Capturing(target, rx);
+    }
+
+    /// Applies the desktop text size and the user's zoom shortcuts, and
+    /// resizes the window when the effective zoom has changed.
+    ///
+    /// egui's built-in keyboard zoom is turned off (in `main`) and redone
+    /// here with the same shortcuts and steps, because its Ctrl+0 resets
+    /// to 1.0 — which would throw away the desktop's text size. Here the
+    /// shortcuts act on a multiplier over it, and Ctrl+0 returns to the
+    /// desktop's size.
+    fn update_zoom(&mut self, ctx: &egui::Context) {
+        use egui::gui_zoom::kb_shortcuts as kb;
+
+        while let Ok(factor) = self.text_scale_rx.try_recv() {
+            self.text_scale = factor;
+        }
+
+        // Not inside another `ctx.input` closure: each shortcut takes the
+        // input lock on its own.
+        let shortcut = |s: &egui::KeyboardShortcut| ctx.input_mut(|i| i.consume_shortcut(s));
+        if shortcut(&kb::ZOOM_RESET) {
+            self.user_zoom = 1.0;
+        } else {
+            if shortcut(&kb::ZOOM_IN) || shortcut(&kb::ZOOM_IN_SECONDARY) {
+                self.user_zoom += 0.1;
+            }
+            if shortcut(&kb::ZOOM_OUT) {
+                self.user_zoom -= 0.1;
+            }
+            // Rounded so ten steps up and ten down land back on exactly 1.
+            self.user_zoom = ((self.user_zoom * 10.0).round() / 10.0).clamp(0.5, 3.0);
+        }
+
+        let wanted = self.text_scale * self.user_zoom;
+        if (ctx.zoom_factor() - wanted).abs() > 1e-4 {
+            // Takes effect at the start of the next frame (which this
+            // requests), where the check below then resizes the window.
+            ctx.set_zoom_factor(wanted);
+        }
+
+        let zoom = ctx.zoom_factor();
+        if (zoom - self.applied_zoom).abs() > 1e-4 {
+            self.applied_zoom = zoom;
+            // `InnerSize` is in points, which the zoom has just enlarged,
+            // so the same `WINDOW_SIZE` now means a bigger window.
+            //
+            // The `Resizable` bracket is needed because a non-resizable
+            // window has its min and max size pinned to its current size
+            // (winit sets both on Wayland), which the compositor would
+            // hold it to. Turning resizing back off afterwards re-pins
+            // min = max to the new size.
+            let root = egui::ViewportId::ROOT;
+            ctx.send_viewport_cmd_to(root, egui::ViewportCommand::Resizable(true));
+            ctx.send_viewport_cmd_to(root, egui::ViewportCommand::InnerSize(WINDOW_SIZE.into()));
+            ctx.send_viewport_cmd_to(root, egui::ViewportCommand::Resizable(false));
+        }
     }
 
     fn row_mut(&mut self, target: Target) -> &mut ColorRowState {
@@ -1566,6 +1638,8 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
+
+        self.update_zoom(ctx);
 
         let p = Palette::new(ui.visuals().dark_mode);
         let picking = !matches!(self.mode, Mode::Normal);
@@ -1888,10 +1962,15 @@ fn setup_style(ctx: &egui::Context) {
 }
 
 pub fn main() -> anyhow::Result<()> {
+    // Read before the window exists, so it opens at its final size. eframe
+    // creates the window before the app (with a zoom of 1), hence the size
+    // scaled by hand here and the zoom set in the creator below.
+    let text_scale = crate::text_scale::read_blocking();
+
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size(WINDOW_SIZE)
+            .with_inner_size([WINDOW_SIZE[0] * text_scale, WINDOW_SIZE[1] * text_scale])
             .with_resizable(false)
             .with_maximize_button(false),
         ..Default::default()
@@ -1903,7 +1982,19 @@ pub fn main() -> anyhow::Result<()> {
         Box::new(|cc| {
             setup_fonts(&cc.egui_ctx);
             setup_style(&cc.egui_ctx);
-            Ok(Box::new(App::default()))
+            // Replaced by `App::update_zoom` (see there for why).
+            cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+            cc.egui_ctx.set_zoom_factor(text_scale);
+
+            let (tx, text_scale_rx) = std::sync::mpsc::channel();
+            crate::text_scale::watch(cc.egui_ctx.clone(), tx);
+
+            Ok(Box::new(App {
+                text_scale,
+                text_scale_rx,
+                applied_zoom: text_scale,
+                ..App::default()
+            }))
         }),
     )
     .map_err(|err| anyhow::anyhow!("eframe failed: {err}"))?;

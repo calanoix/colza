@@ -424,6 +424,7 @@ dependencies = [
  "ashpd",
  "eframe",
  "egui",
+ "futures-util",
  "image",
  "pipewire",
  "tokio",

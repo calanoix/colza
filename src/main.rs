@@ -4,6 +4,7 @@ mod magnifier;
 mod portal;
 mod runtime;
 mod screencast;
+mod text_scale;
 mod token_store;
 
 fn main() -> anyhow::Result<()> {
