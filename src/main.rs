@@ -1,6 +1,7 @@
 mod app;
 mod color;
 mod magnifier;
+mod permissions;
 mod portal;
 mod prefs;
 mod runtime;

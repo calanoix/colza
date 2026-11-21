@@ -27,7 +27,7 @@
 //!
 //! Resetting the grant: it lives in the compositor's own privacy settings
 //! (GNOME: Settings → Privacy → Screen Sharing), plus `token_store.rs`'s
-//! file ("Forget shared screen" on the settings page). Revoking on the
+//! file ("Reset" under Permissions on the settings page). Revoking on the
 //! compositor side while the token file remains just means the next
 //! `select_sources` sends a stale token, which the portal ignores in favor
 //! of prompting, and the new token then gets saved. No cleanup is needed
@@ -35,7 +35,7 @@
 
 use crate::token_store;
 use ashpd::desktop::{
-    screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
+    screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType, Streams},
     PersistMode, Session,
 };
 use image::RgbImage;
@@ -100,10 +100,79 @@ struct StreamDiagnostics {
 static SCREENCAST_DECLINED: AtomicBool = AtomicBool::new(false);
 
 /// Clears a "no" given earlier in this run, so the next pick asks for
-/// screen sharing again. Called when the user picks live capture on the
-/// settings page: choosing it there is a clear sign they now want it.
+/// screen sharing again. Called by "Reset" under Permissions on the
+/// settings page.
 pub fn forget_declined() {
     SCREENCAST_DECLINED.store(false, Ordering::Relaxed);
+}
+
+/// Whether the user declined screen sharing earlier in this run, so that
+/// live picks currently go straight to a still screenshot. Shown on the
+/// settings page, which is the only place this state is visible: the
+/// portal itself stores no refusal for ScreenCast (each request either
+/// restores a saved grant or shows the picker), so this flag *is* the
+/// whole "denied" state.
+pub fn was_declined() -> bool {
+    SCREENCAST_DECLINED.load(Ordering::Relaxed)
+}
+
+/// The portal side of a screen share: creates a session, selects a
+/// monitor (restoring the saved grant, or showing the picker), starts it,
+/// and saves the new restore token. Returns the running session and what
+/// it streams; the caller owns closing the session.
+///
+/// On failure the half-open session is closed here, so a declined picker
+/// doesn't leave it lingering server-side until colza exits.
+async fn start_session() -> anyhow::Result<(Session<Screencast>, Streams)> {
+    let proxy: Screencast = Screencast::new().await?;
+    let session = proxy.create_session(Default::default()).await?;
+
+    let result: anyhow::Result<Streams> = async {
+        proxy
+            .select_sources(
+                &session,
+                SelectSourcesOptions::default()
+                    .set_cursor_mode(CursorMode::Hidden)
+                    .set_sources(Some(SourceType::Monitor.into()))
+                    // Only ever one output: asking for multiple just adds
+                    // a "select all the ones you want" step to the picker
+                    // dialog for no benefit here.
+                    .set_multiple(false)
+                    // The saved token plus `ExplicitlyRevoked` are what
+                    // suppress the picker dialog on later runs.
+                    // `Application` would only persist for the running
+                    // process, so it would still prompt once per launch.
+                    .set_restore_token(token_store::load().as_deref())
+                    .set_persist_mode(PersistMode::ExplicitlyRevoked),
+            )
+            .await?
+            .response()?;
+
+        // `None` here means the dialog, on runs where it appears, isn't
+        // parented to colza's window: exporting a real handle would need
+        // ashpd's wayland/gtk4 features and access to eframe's surface.
+        let response = proxy
+            .start(&session, None, Default::default())
+            .await?
+            .response()?;
+
+        // Saved immediately: each successful `start()` invalidates the
+        // token that was sent, so skipping this re-save is what would make
+        // the dialog reappear on every second run.
+        if let Some(token) = response.restore_token() {
+            token_store::store(token);
+        }
+        Ok(response)
+    }
+    .await;
+
+    match result {
+        Ok(streams) => Ok((session, streams)),
+        Err(err) => {
+            let _ = session.close().await;
+            Err(err)
+        }
+    }
 }
 
 /// Where the magnifier's pixels come from.
@@ -163,7 +232,8 @@ pub async fn open_best() -> anyhow::Result<(ScreenSource, RgbImage)> {
                 eprintln!(
                     "colza: screen sharing declined, falling back to a still screenshot. \
                      The magnifier will not track changes on screen, and the mouse cursor \
-                     will appear in the captured image. Restart colza to be asked again."
+                     will appear in the captured image. Reset screen sharing under \
+                     Settings → Permissions (or restart colza) to be asked again."
                 );
             }
             Err(err) => return Err(err),
@@ -224,43 +294,7 @@ impl Capture {
     /// Must be awaited on `runtime::shared()`: ashpd's cached D-Bus
     /// connection binds to the first runtime it sees (see `runtime.rs`).
     pub async fn open() -> anyhow::Result<(Self, RgbImage)> {
-        let proxy: Screencast = Screencast::new().await?;
-        let session = proxy.create_session(Default::default()).await?;
-
-        proxy
-            .select_sources(
-                &session,
-                SelectSourcesOptions::default()
-                    .set_cursor_mode(CursorMode::Hidden)
-                    .set_sources(Some(SourceType::Monitor.into()))
-                    // Only ever one output: asking for multiple just adds
-                    // a "select all the ones you want" step to the picker
-                    // dialog for no benefit here.
-                    .set_multiple(false)
-                    // The saved token plus `ExplicitlyRevoked` are what
-                    // suppress the picker dialog on later runs.
-                    // `Application` would only persist for the running
-                    // process, so it would still prompt once per launch.
-                    .set_restore_token(token_store::load().as_deref())
-                    .set_persist_mode(PersistMode::ExplicitlyRevoked),
-            )
-            .await?
-            .response()?;
-
-        // `None` here means the dialog, on runs where it appears, isn't
-        // parented to colza's window: exporting a real handle would need
-        // ashpd's wayland/gtk4 features and access to eframe's surface.
-        let response = proxy
-            .start(&session, None, Default::default())
-            .await?
-            .response()?;
-
-        // Saved immediately: each successful `start()` invalidates the
-        // token that was sent, so skipping this re-save is what would make
-        // the dialog reappear on every second run.
-        if let Some(token) = response.restore_token() {
-            token_store::store(token);
-        }
+        let (session, response) = start_session().await?;
 
         let stream = response
             .streams()
@@ -268,7 +302,10 @@ impl Capture {
             .ok_or_else(|| anyhow::anyhow!("compositor returned no screencast streams"))?;
         let node_id = stream.pipe_wire_node_id();
 
-        let pw_fd = proxy
+        // A second proxy is just a handle on ashpd's shared connection,
+        // so this costs no extra D-Bus setup.
+        let pw_fd = Screencast::new()
+            .await?
             .open_pipe_wire_remote(&session, Default::default())
             .await?;
 

@@ -13,9 +13,11 @@
 //!     OkLCh's L/C/H, plus Alpha, with gradient rails and value
 //!     readouts).
 //!
-//! The settings button swaps the body for a settings page (theme, screen
-//! capture method, text-size shortcuts; version and repository link in
-//! its header), saved by `prefs.rs`. Back, or Escape, returns.
+//! The settings button swaps the body for a settings page (theme,
+//! text-size shortcuts, and the capture permissions with a "Reset" for
+//! each, see `permissions.rs`; version and
+//! repository link in its header), saved by `prefs.rs`. Back, or Escape,
+//! returns. The page scrolls, since it outgrew the fixed window.
 //!
 //! Picking a color opens the magnifier as a second egui viewport so the
 //! main window stays visible while the loupe is up.
@@ -38,7 +40,6 @@ use image::RgbImage;
 
 use crate::color::{format_number, Hsl, Oklch, Rgb};
 use crate::magnifier::MagnifierState;
-use crate::prefs::CaptureMethod;
 use crate::screencast::ScreenSource;
 
 /// Colors shared with flax's `panel.css` (`:root` for light,
@@ -917,129 +918,6 @@ fn list_arrow_keys(
     ui.ctx().request_repaint();
 }
 
-/// Vertical radio group in flax's style (`.radio-group`): a circle, a
-/// label, and a muted description under it, the whole row clickable.
-/// Returns true if the selection changed.
-///
-/// Accessibility as for [`segmented_control`]: a `RadioGroup` named
-/// `group` holding radio buttons with their checked state; each option's
-/// description is attached as its accessible description, so it's read
-/// after the name rather than as loose text. Arrows move the selection
-/// and focus (wrapping), Space/Enter select.
-fn radio_group<T: Copy + PartialEq>(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    group: &str,
-    value: &mut T,
-    options: &[(T, &str, &str)],
-) -> bool {
-    const CIRCLE_RADIUS: f32 = 7.0;
-    const TEXT_X: f32 = 26.0;
-
-    ui.scope(|ui| {
-        a11y(ui, ui.unique_id(), |node| {
-            node.set_role(egui::accesskit::Role::RadioGroup);
-            node.set_label(group);
-        });
-        ui.spacing_mut().item_spacing.y = 10.0;
-
-        let base_id = ui.id().with(("radio", group));
-        let ids: Vec<egui::Id> = (0..options.len()).map(|i| base_id.with(i)).collect();
-        let mut selected = options.iter().position(|(v, _, _)| v == value);
-        let before = selected;
-        let width = ui.available_width();
-
-        for (i, (_, label, description)) in options.iter().enumerate() {
-            let label_galley = ui.painter().layout_no_wrap(
-                (*label).to_owned(),
-                egui::FontId::proportional(13.0),
-                p.text,
-            );
-            let description_galley = ui.painter().layout(
-                (*description).to_owned(),
-                egui::FontId::proportional(12.0),
-                p.text_secondary,
-                width - TEXT_X,
-            );
-            let label_height = label_galley.size().y;
-            let height = label_height + 2.0 + description_galley.size().y;
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-            let resp = ui.interact(rect, ids[i], egui::Sense::click());
-
-            let is_selected = selected == Some(i);
-            resp.widget_info(|| {
-                egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, is_selected, *label)
-            });
-            let description_text = (*description).to_owned();
-            a11y(ui, resp.id, |node| node.set_description(description_text));
-
-            if resp.clicked() {
-                selected = Some(i);
-            }
-            if resp.has_focus() {
-                let step: isize = ui.input_mut(|input| {
-                    let mut d = 0;
-                    for key in [egui::Key::ArrowUp, egui::Key::ArrowLeft] {
-                        if input.consume_key(egui::Modifiers::NONE, key) {
-                            d -= 1;
-                        }
-                    }
-                    for key in [egui::Key::ArrowDown, egui::Key::ArrowRight] {
-                        if input.consume_key(egui::Modifiers::NONE, key) {
-                            d += 1;
-                        }
-                    }
-                    d
-                });
-                if step != 0 {
-                    let j = (i as isize + step).rem_euclid(options.len() as isize) as usize;
-                    selected = Some(j);
-                    ui.memory_mut(|m| m.request_focus(ids[j]));
-                }
-            }
-
-            // Drawn with this frame's selection, so a click shows at once.
-            let on = selected == Some(i);
-            let center = egui::pos2(rect.left() + CIRCLE_RADIUS + 1.0, rect.top() + label_height / 2.0);
-            let ring = if on {
-                p.accent
-            } else if resp.hovered() {
-                p.text
-            } else {
-                p.text_secondary
-            };
-            ui.painter().circle_stroke(center, CIRCLE_RADIUS, egui::Stroke::new(1.5, ring));
-            if on {
-                ui.painter().circle_filled(center, CIRCLE_RADIUS - 3.0, p.accent);
-            }
-            let text_x = rect.left() + TEXT_X;
-            ui.painter().galley(egui::pos2(text_x, rect.top()), label_galley, p.text);
-            ui.painter().galley(
-                egui::pos2(text_x, rect.top() + label_height + 2.0),
-                description_galley,
-                p.text_secondary,
-            );
-            if resp.has_focus() {
-                ui.painter().rect_stroke(
-                    rect.expand(4.0),
-                    6.0,
-                    egui::Stroke::new(2.0, p.focus),
-                    egui::StrokeKind::Outside,
-                );
-            }
-        }
-
-        match selected {
-            Some(i) if selected != before => {
-                *value = options[i].0;
-                true
-            }
-            _ => false,
-        }
-    })
-    .inner
-}
-
 /// A key drawn as a keycap, for the keyboard-shortcut list.
 fn keycap(ui: &mut egui::Ui, p: &Palette, key: &str) {
     egui::Frame::new()
@@ -1220,7 +1098,7 @@ fn open_in_browser(url: &str) {
 
 /// Small uppercase tag, like flax's `.best-practice-tag`. Exposes its
 /// text to screen readers.
-fn tag(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
+fn tag(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(
         text.to_uppercase(),
         egui::FontId::new(9.0, bold()),
@@ -1232,6 +1110,7 @@ fn tag(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
     ui.painter().rect_filled(rect, 3.0, bg);
     ui.painter()
         .galley(rect.center() - galley.size() / 2.0, galley, fg);
+    resp
 }
 
 /// Edits the AccessKit node egui built for `id` this frame. Must run
@@ -1405,6 +1284,76 @@ fn segmented_control<T: Copy + PartialEq>(
     .inner
 }
 
+/// A permission's state as the Permissions card shows it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PermissionState {
+    Unset,
+    Denied,
+    Approved,
+}
+
+impl PermissionState {
+    fn from_answer(answer: Option<crate::permissions::Answer>) -> Self {
+        use crate::permissions::Answer;
+        match answer {
+            Some(Answer::Allowed) => Self::Approved,
+            Some(Answer::Denied) => Self::Denied,
+            Some(Answer::Unset) | None => Self::Unset,
+        }
+    }
+}
+
+/// One row of the Permissions card: the permission's name and its state
+/// as a badge on the left, "Reset" on the right (disabled when unset,
+/// with nothing to reset), and what the method does under them. Returns
+/// whether "Reset" was activated.
+///
+/// The badge is a polite live region: it changes on its own (a pick's
+/// dialog answered, a reset), and a screen reader should say so without
+/// moving focus. "Reset" is named after its row for assistive tech,
+/// since every row has one.
+fn permission_row(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    name: &str,
+    description: &str,
+    state: PermissionState,
+    reset_enabled: bool,
+) -> bool {
+    ui.scope(|ui| {
+        // The description belongs to the row above it: kept close to it.
+        ui.spacing_mut().item_spacing.y = 2.0;
+        let reset = ui.horizontal(|ui| {
+            ui.spacing_mut().interact_size.y = 28.0;
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(egui::RichText::new(name).size(13.0).family(bold()).color(p.text));
+            // Neutral for unset: secondary text on the toolbar grey, 5.7:1
+            // (light) and 5.9:1 (dark). The other two match Pass/Fail.
+            let badge = match state {
+                PermissionState::Unset => tag(ui, "Unset", p.text_secondary, p.toolbar_bg),
+                PermissionState::Denied => tag(ui, "Denied", egui::Color32::WHITE, FAIL_BG),
+                PermissionState::Approved => tag(ui, "Approved", p.tag_fg, p.tag_bg),
+            };
+            a11y(ui, badge.id, |node| node.set_live(egui::accesskit::Live::Polite));
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let reset = ui.add_enabled(
+                    reset_enabled && state != PermissionState::Unset,
+                    egui::Button::new(egui::RichText::new("Reset").size(12.0)),
+                );
+                let reset_name = format!("Reset {} permission", name.to_lowercase());
+                a11y(ui, reset.id, |node| node.set_label(reset_name));
+                reset.clicked()
+            })
+            .inner
+        })
+        .inner;
+        ui.label(egui::RichText::new(description).size(12.0).color(p.text_secondary));
+        reset
+    })
+    .inner
+}
+
 /// Card title row (flax's `.settings-card-title`): bold 14px title on the
 /// left, optional trailing content on the right, then a divider.
 fn card_title(
@@ -1544,6 +1493,7 @@ impl ColorCard {
         ui: &mut egui::Ui,
         p: &Palette,
         picking: bool,
+        blocked: Option<&str>,
         on_pick: impl FnOnce(),
     ) -> f32 {
         // Title + compact format dropdown.
@@ -1634,14 +1584,15 @@ impl ColorCard {
 
             // Frameless eyedropper: allocate the hit target directly so no
             // button background can appear on press or focus.
+            let disabled = picking || blocked.is_some();
             let (icon_rect, pick_button) = ui.allocate_exact_size(
                 egui::vec2(CONTROL_SIZE, CONTROL_SIZE),
-                if picking { egui::Sense::hover() } else { egui::Sense::click() },
+                if disabled { egui::Sense::hover() } else { egui::Sense::click() },
             );
-            if pick_button.hovered() && !picking {
+            if pick_button.hovered() && !disabled {
                 ui.painter().rect_filled(icon_rect, 6.0, ICON_HOVER);
             }
-            let icon_color = if picking {
+            let icon_color = if disabled {
                 p.border
             } else {
                 p.text_secondary
@@ -1657,9 +1608,19 @@ impl ColorCard {
             }
             let name = format!("Pick {} color from screen", self.label.to_lowercase());
             pick_button.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Button, !picking, name.clone())
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, !disabled, name.clone())
             });
-            if pick_button.on_hover_text("Pick color from screen").clicked() {
+            // The reason is also the accessible description: a disabled
+            // button can't take focus, so keyboard and screen-reader users
+            // would never reach the tooltip.
+            if let Some(reason) = blocked {
+                let reason = reason.to_owned();
+                a11y(ui, pick_button.id, |node| node.set_description(reason));
+            }
+            if pick_button
+                .on_hover_text(blocked.unwrap_or("Pick color from screen"))
+                .clicked()
+            {
                 on_pick();
             }
         });
@@ -1750,6 +1711,24 @@ const APCA_CRITERIA: [Criterion; 5] = [
     Criterion { threshold_text: "Lc 90", label: "Preferred body text", threshold: 90.0 },
 ];
 
+/// The screen-capture permissions' state, shown on the settings page's
+/// Permissions card and used to disable picking when both are denied.
+///
+/// Reads of the screenshot permission (and its reset) are D-Bus
+/// round-trips, run on the shared runtime and reported back over a
+/// channel polled each frame, like a pick, so the window never waits.
+#[derive(Default)]
+struct PermissionsState {
+    /// A screenshot-permission lookup (possibly after a reset) in progress.
+    screenshot_task: Option<std::sync::mpsc::Receiver<crate::permissions::Lookup>>,
+    /// The latest screenshot permission seen; `None` before the first
+    /// lookup has come back.
+    screenshot: Option<crate::permissions::Lookup>,
+    /// Shows the `flatpak permission-remove` command: sandboxed, the
+    /// stored answer can only be reset from outside (see `permissions.rs`).
+    show_reset_command: bool,
+}
+
 struct App {
     mode: Mode,
     method: Method,
@@ -1766,8 +1745,11 @@ struct App {
     page: Page,
     prefs: crate::prefs::Prefs,
     /// Whether a screencast restore token is saved; read when the
-    /// settings page opens and after "Forget", not every frame.
+    /// settings page opens, after a pick and after "Reset", not every
+    /// frame.
     has_restore_token: bool,
+    /// The settings page's Permissions card.
+    permissions: PermissionsState,
     /// Widget to focus at the start of the next frame (see `navigate`).
     pending_focus: Option<egui::Id>,
 }
@@ -1787,6 +1769,7 @@ impl Default for App {
             page: Page::Main,
             prefs: crate::prefs::Prefs::default(),
             has_restore_token: false,
+            permissions: PermissionsState::default(),
             pending_focus: None,
         }
     }
@@ -1821,29 +1804,22 @@ impl App {
         }
     }
 
-    /// Kicks off the pick flow for `target`: spawns the capture chosen on
-    /// the settings page as a task on the shared runtime and sends the
-    /// resulting `ScreenSource` (plus its first frame) back over a
-    /// channel. Returns immediately: nothing here blocks the calling
-    /// `ui()` frame.
+    /// Kicks off the pick flow for `target`: opens the first capture
+    /// method not denied, in the order of the settings page's Permissions
+    /// card, as a task on the shared runtime, and sends the resulting
+    /// `ScreenSource` (plus its first frame) back over a channel. Returns
+    /// immediately: nothing here blocks the calling `ui()` frame.
     ///
-    /// Live goes through `screencast::open_best()`, which still falls back
-    /// to a screenshot if the user declines the share; Still goes straight
-    /// to the Screenshot portal and never asks for screen sharing.
+    /// That order is `screencast::open_best()`'s: screen sharing unless
+    /// declined (asking if nothing is remembered), then a screenshot. With
+    /// both denied, the eyedroppers are disabled and this isn't reached.
     fn start_picking(&mut self, target: Target) {
         let (tx, rx) = std::sync::mpsc::channel();
-        let method = self.prefs.capture_method;
 
         match crate::runtime::shared() {
             Ok(rt) => {
                 rt.spawn(async move {
-                    let result = match method {
-                        CaptureMethod::Live => crate::screencast::open_best().await,
-                        CaptureMethod::Still => crate::portal::capture_screen()
-                            .await
-                            .map(|image| (ScreenSource::Still, image)),
-                    };
-                    let _ = tx.send(result);
+                    let _ = tx.send(crate::screencast::open_best().await);
                 });
             }
             Err(err) => {
@@ -2013,131 +1989,76 @@ impl App {
         let top_down = egui::Layout::top_down(egui::Align::Min);
         let mut changed = false;
 
+        // Scrolls: the window has a fixed size, and the two columns are
+        // taller than it once the Permissions card is in. egui scrolls the
+        // focused widget into view, so Tab reaches everything too.
         ui.scope_builder(
             egui::UiBuilder::new().id_salt("settings").max_rect(content).layout(top_down),
             |ui| {
-                let column_width = ((ui.available_width() - COLUMN_GAP) / 2.0).max(0.0);
-                let size = egui::vec2(column_width, ui.available_height());
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(COLUMN_GAP, COLUMN_GAP);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    let column_width = ((ui.available_width() - COLUMN_GAP) / 2.0).max(0.0);
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(COLUMN_GAP, COLUMN_GAP);
 
-                    ui.allocate_ui_with_layout(size, top_down, |ui| {
-                        ui.spacing_mut().item_spacing.y = COLUMN_GAP;
+                        ui.vertical(|ui| {
+                            ui.set_width(column_width);
+                            ui.spacing_mut().item_spacing.y = COLUMN_GAP;
 
-                        // Appearance.
-                        card(ui, p, |ui| {
-                            card_title(ui, p, "Appearance", |_| {});
-                            field_label(ui, "Theme");
-                            // Full-width and as tall as flax's <select>.
-                            ui.spacing_mut().interact_size.y = 32.0;
-                            let theme = &mut self.prefs.theme;
-                            let combo = egui::ComboBox::from_id_salt("theme")
-                                .width(ui.available_width())
-                                .selected_text(egui::RichText::new(theme.label()).size(13.0).color(p.text));
-                            let (combo, theme_changed) =
-                                select_box(ui, combo, theme, &crate::prefs::Theme::ALL, |t| {
-                                    egui::RichText::new(t.label()).size(13.0)
-                                });
-                            changed |= theme_changed;
-                            a11y(ui, combo.id, |node| node.set_label("Theme"));
-                        });
-
-                        // Text size: just the shortcuts. The desktop's own
-                        // size is applied automatically (`text_scale.rs`).
-                        card(ui, p, |ui| {
-                            card_title(ui, p, "Text size", |_| {});
-                            egui::Frame::new()
-                                .fill(p.toolbar_bg)
-                                .stroke(egui::Stroke::new(1.0_f32, p.border))
-                                .corner_radius(6.0)
-                                .inner_margin(12.0)
-                                .show(ui, |ui| {
-                                    ui.set_min_width(ui.available_width());
-                                    egui::Grid::new("shortcuts")
-                                        .num_columns(2)
-                                        .spacing(egui::vec2(16.0, 8.0))
-                                        .show(ui, |ui| {
-                                            for (key, action) in [
-                                                ("+", "Larger"),
-                                                ("-", "Smaller"),
-                                                ("0", "Reset to system size"),
-                                            ] {
-                                                ui.horizontal(|ui| {
-                                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                                    keycap(ui, p, "Ctrl");
-                                                    keycap(ui, p, key);
-                                                });
-                                                body(ui, action);
-                                                ui.end_row();
-                                            }
-                                        });
-                                });
-                        });
-                    });
-
-                    ui.allocate_ui_with_layout(size, top_down, |ui| {
-                        // Screen capture.
-                        card(ui, p, |ui| {
-                            card_title(ui, p, "Screen capture", |_| {});
-                            body(ui, "colza looks at your screen only while you pick a color.");
-                            ui.add_space(4.0);
-                            field_label(ui, "Capture method");
-                            let before = self.prefs.capture_method;
-                            if radio_group(
-                                ui,
-                                p,
-                                "Capture method",
-                                &mut self.prefs.capture_method,
-                                &[
-                                    (
-                                        CaptureMethod::Live,
-                                        "Live (screen sharing)",
-                                        "Follows videos and animations as they play, without \
-                                         the mouse cursor. Your desktop asks once which screen \
-                                         to share.",
-                                    ),
-                                    (
-                                        CaptureMethod::Still,
-                                        "Still image (screenshot)",
-                                        "One screenshot per pick: the image stays frozen while \
-                                         the loupe is open, and shows the mouse cursor.",
-                                    ),
-                                ],
-                            ) {
-                                changed = true;
-                                if self.prefs.capture_method == CaptureMethod::Live
-                                    && before != CaptureMethod::Live
-                                {
-                                    // Choosing live here is a clear "yes"
-                                    // to a share declined earlier this run.
-                                    crate::screencast::forget_declined();
-                                }
-                            }
-
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().interact_size.y = 28.0;
-                                let forget = ui.add_enabled(
-                                    self.has_restore_token,
-                                    egui::Button::new(
-                                        egui::RichText::new("Forget shared screen").size(12.0),
-                                    ),
-                                );
-                                if forget.clicked() {
-                                    crate::token_store::clear();
-                                    self.has_restore_token = crate::token_store::exists();
-                                }
+                            // Appearance.
+                            card(ui, p, |ui| {
+                                card_title(ui, p, "Appearance", |_| {});
+                                field_label(ui, "Theme");
+                                // Full-width and as tall as flax's <select>.
+                                ui.spacing_mut().interact_size.y = 32.0;
+                                let theme = &mut self.prefs.theme;
+                                let combo = egui::ComboBox::from_id_salt("theme")
+                                    .width(ui.available_width())
+                                    .selected_text(egui::RichText::new(theme.label()).size(13.0).color(p.text));
+                                let (combo, theme_changed) =
+                                    select_box(ui, combo, theme, &crate::prefs::Theme::ALL, |t| {
+                                        egui::RichText::new(t.label()).size(13.0)
+                                    });
+                                changed |= theme_changed;
+                                a11y(ui, combo.id, |node| node.set_label("Theme"));
                             });
-                            body(
-                                ui,
-                                if self.has_restore_token {
-                                    "A shared screen is remembered. Forget it to choose \
-                                     another at the next live pick."
-                                } else {
-                                    "No shared screen remembered: the next live pick will \
-                                     ask which screen to share."
-                                },
-                            );
+
+                            // Text size: just the shortcuts. The desktop's own
+                            // size is applied automatically (`text_scale.rs`).
+                            card(ui, p, |ui| {
+                                card_title(ui, p, "Text size", |_| {});
+                                egui::Frame::new()
+                                    .fill(p.toolbar_bg)
+                                    .stroke(egui::Stroke::new(1.0_f32, p.border))
+                                    .corner_radius(6.0)
+                                    .inner_margin(12.0)
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        egui::Grid::new("shortcuts")
+                                            .num_columns(2)
+                                            .spacing(egui::vec2(16.0, 8.0))
+                                            .show(ui, |ui| {
+                                                for (key, action) in [
+                                                    ("+", "Larger"),
+                                                    ("-", "Smaller"),
+                                                    ("0", "Reset to system size"),
+                                                ] {
+                                                    ui.horizontal(|ui| {
+                                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                                        keycap(ui, p, "Ctrl");
+                                                        keycap(ui, p, key);
+                                                    });
+                                                    body(ui, action);
+                                                    ui.end_row();
+                                                }
+                                            });
+                                    });
+                            });
+                        });
+
+                        ui.vertical(|ui| {
+                            ui.set_width(column_width);
+                            ui.spacing_mut().item_spacing.y = COLUMN_GAP;
+                            self.draw_permissions(ui, p);
                         });
                     });
                 });
@@ -2147,6 +2068,181 @@ impl App {
         if changed {
             self.apply_theme(ui.ctx());
             self.prefs.save();
+        }
+    }
+
+    /// State of the screen-sharing permission. ScreenCast stores no
+    /// refusal (see `permissions.rs`): "denied" is colza's own flag for
+    /// this run, "approved" a saved restore token.
+    fn screencast_state(&self) -> PermissionState {
+        if crate::screencast::was_declined() {
+            PermissionState::Denied
+        } else if self.has_restore_token {
+            PermissionState::Approved
+        } else {
+            PermissionState::Unset
+        }
+    }
+
+    fn screenshot_state(&self) -> PermissionState {
+        PermissionState::from_answer(
+            self.permissions.screenshot.and_then(crate::permissions::Lookup::answer),
+        )
+    }
+
+    /// Whether both capture methods are denied, so no pick can succeed.
+    fn picking_blocked(&self) -> bool {
+        self.screencast_state() == PermissionState::Denied
+            && self.screenshot_state() == PermissionState::Denied
+    }
+
+    /// The Permissions card: one row per capture method, in the order a
+    /// pick tries them (see `start_picking`), with its state and "Reset".
+    /// Reset only goes back to unset; the question itself comes from the
+    /// next pick (see `permissions.rs` for why the two differ underneath).
+    fn draw_permissions(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        // No reset under a pick in flight, which may be asking right now.
+        let idle = matches!(self.mode, Mode::Normal);
+
+        card(ui, p, |ui| {
+            card_title(ui, p, "Permissions", |_| {});
+            ui.label(
+                egui::RichText::new(
+                    "colza looks at your screen only while you pick a color. It uses the \
+                     first method below that isn't denied.",
+                )
+                .size(12.0)
+                .color(p.text_secondary),
+            );
+            ui.add_space(4.0);
+
+            if permission_row(
+                ui,
+                p,
+                "Screen sharing",
+                "Pick a color from a live feed of your screen.",
+                self.screencast_state(),
+                idle,
+            ) {
+                crate::screencast::forget_declined();
+                crate::token_store::clear();
+                self.has_restore_token = crate::token_store::exists();
+            }
+
+            ui.add(egui::Separator::default().spacing(8.0));
+
+            let screenshot_idle = idle && self.permissions.screenshot_task.is_none();
+            if permission_row(
+                ui,
+                p,
+                "Screenshot",
+                "Pick a color from a screenshot. Mouse cursor is visible.",
+                self.screenshot_state(),
+                screenshot_idle,
+            ) {
+                if crate::permissions::is_sandboxed() {
+                    // colza forgets what it saw, so picking is offered
+                    // again: the next pick asks if the command below was
+                    // run, and comes back denied otherwise.
+                    crate::permissions::record_outcome(crate::permissions::Answer::Unset);
+                    self.permissions.show_reset_command = true;
+                    self.refresh_screenshot_permission(false);
+                } else {
+                    self.refresh_screenshot_permission(true);
+                }
+            }
+
+            if let Some(command) = crate::permissions::reset_command()
+                .filter(|_| self.permissions.show_reset_command)
+            {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "colza's sandbox can't reset this itself. To be asked again, run \
+                         this command in a terminal:",
+                    )
+                    .size(12.0)
+                    .color(p.text_secondary),
+                );
+                egui::Frame::new()
+                    .fill(p.toolbar_bg)
+                    .stroke(egui::Stroke::new(1.0_f32, p.border))
+                    .corner_radius(6.0)
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&command).monospace().size(11.0).color(p.text),
+                            )
+                            .selectable(true),
+                        );
+                    });
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().interact_size.y = 28.0;
+                    if ui.button(egui::RichText::new("Copy command").size(12.0)).clicked() {
+                        ui.ctx().copy_text(command);
+                    }
+                });
+            }
+        });
+    }
+
+    /// Looks the screenshot permission up again (resetting it first if
+    /// `reset`) on the shared runtime; the result lands in
+    /// `poll_permission_tasks`. Does nothing if a lookup is running.
+    fn refresh_screenshot_permission(&mut self, reset: bool) {
+        if self.permissions.screenshot_task.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        match crate::runtime::shared() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    if reset {
+                        if let Err(err) = crate::permissions::reset().await {
+                            eprintln!("colza: could not reset the screenshot permission: {err}");
+                        }
+                    }
+                    let _ = tx.send(crate::permissions::lookup().await);
+                });
+                self.permissions.screenshot_task = Some(rx);
+            }
+            Err(err) => eprintln!("colza: could not check the screenshot permission: {err}"),
+        }
+    }
+
+    /// Collects a finished lookup, and starts the first one at launch:
+    /// the main window needs it too, to know whether picking can work.
+    fn poll_permission_tasks(&mut self, ctx: &egui::Context) {
+        use std::sync::mpsc::TryRecvError;
+
+        if self.permissions.screenshot.is_none() && self.permissions.screenshot_task.is_none() {
+            self.has_restore_token = crate::token_store::exists();
+            self.refresh_screenshot_permission(false);
+        }
+
+        let state = &mut self.permissions;
+        if let Some(rx) = &state.screenshot_task {
+            match rx.try_recv() {
+                Ok(lookup) => {
+                    state.screenshot_task = None;
+                    state.screenshot = Some(lookup);
+                    // Kept up until a screenshot goes through: until then,
+                    // the user may still need the command.
+                    if lookup.answer() == Some(crate::permissions::Answer::Allowed) {
+                        state.show_reset_command = false;
+                    }
+                }
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    state.screenshot_task = None;
+                    // Not left `None`, which would start a lookup per frame.
+                    state.screenshot = Some(crate::permissions::Lookup::Observed(None));
+                }
+            }
         }
     }
 
@@ -2168,6 +2264,7 @@ impl App {
         self.page = to;
         if to == Page::Settings {
             self.has_restore_token = crate::token_store::exists();
+            self.refresh_screenshot_permission(false);
         }
         if from_keyboard {
             // Deferred to the next frame: the target button belongs to the
@@ -2295,7 +2392,7 @@ impl App {
                     tag(ui, "Pass", p.tag_fg, p.tag_bg);
                 } else {
                     tag(ui, "Fail", egui::Color32::WHITE, FAIL_BG);
-                }
+                };
             });
         });
     }
@@ -2311,12 +2408,16 @@ impl eframe::App for App {
         let ctx = &ctx;
 
         self.update_zoom(ctx);
+        self.poll_permission_tasks(ctx);
         if let Some(id) = self.pending_focus.take() {
             ctx.memory_mut(|m| m.request_focus(id));
         }
 
         let p = Palette::new(ui.visuals().dark_mode);
         let picking = !matches!(self.mode, Mode::Normal);
+        let blocked = self
+            .picking_blocked()
+            .then_some("Reset permissions in settings to enable color picking.");
         let mut pick_target: Option<Target> = None;
         let mut swap_requested = false;
 
@@ -2414,7 +2515,7 @@ impl eframe::App for App {
                                     // Foreground.
                                     ui.allocate_ui_with_layout(size, top_down, |ui| {
                                         card(ui, &p, |ui| {
-                                            self.fg.ui(ui, &p, picking, || {
+                                            self.fg.ui(ui, &p, picking, blocked, || {
                                                 pick_target = Some(Target::Fg)
                                             });
                                         });
@@ -2423,7 +2524,7 @@ impl eframe::App for App {
                                     // Background.
                                     ui.allocate_ui_with_layout(size, top_down, |ui| {
                                         card(ui, &p, |ui| {
-                                            self.bg.ui(ui, &p, picking, || {
+                                            self.bg.ui(ui, &p, picking, blocked, || {
                                                 pick_target = Some(Target::Bg)
                                             });
                                         });
@@ -2447,17 +2548,21 @@ impl eframe::App for App {
             self.start_picking(target);
         }
 
+        // A pick may have just asked for (or been refused) a permission.
+        let mut refresh_permissions = false;
         match &mut self.mode {
             Mode::Normal => {}
 
             Mode::Capturing(target, rx) => match rx.try_recv() {
                 Ok(Ok((source, first_frame))) => {
+                    refresh_permissions = true;
                     let mut state = MagnifierState::new(first_frame);
                     state.live = source.is_live();
                     self.mode = Mode::Magnifying(*target, Box::new(state), source);
                     ctx.request_repaint();
                 }
                 Ok(Err(err)) => {
+                    refresh_permissions = true;
                     eprintln!("colza: screen capture failed: {err}");
                     self.mode = Mode::Normal;
                 }
@@ -2529,6 +2634,11 @@ impl eframe::App for App {
                 }
                 ctx.request_repaint();
             }
+        }
+
+        if refresh_permissions {
+            self.has_restore_token = crate::token_store::exists();
+            self.refresh_screenshot_permission(false);
         }
 
         keep_arrows_off_focus(ctx);
@@ -2668,7 +2778,7 @@ const WINDOW_ICON: &[u8] = include_bytes!("../assets/icon-colza-256.png");
 /// through it, `Icon=colza`). eframe would default to the app name, which
 /// is the same today; set here so renaming the window title can't break
 /// the match. Also names the folder eframe would persist state to.
-const APP_ID: &str = "colza";
+pub(crate) const APP_ID: &str = "colza";
 
 pub fn main() -> anyhow::Result<()> {
     // Read before the window exists, so it opens at its final size. eframe

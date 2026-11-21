@@ -42,35 +42,9 @@ impl Theme {
     }
 }
 
-/// Which portal supplies the image under the loupe.
-///
-/// Named `CaptureMethod` rather than `Capture` to keep it apart from
-/// `screencast::Capture`, the live session itself.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum CaptureMethod {
-    /// `ScreenCast` + PipeWire: live, cursor hidden.
-    #[default]
-    Live,
-    /// `Screenshot`: one still frame per pick, cursor baked in.
-    Still,
-}
-
-impl CaptureMethod {
-    pub const ALL: [Self; 2] = [Self::Live, Self::Still];
-
-    /// The value written to the settings file.
-    fn key(self) -> &'static str {
-        match self {
-            Self::Live => "live",
-            Self::Still => "still",
-        }
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Prefs {
     pub theme: Theme,
-    pub capture_method: CaptureMethod,
 }
 
 impl Prefs {
@@ -111,14 +85,10 @@ impl Prefs {
                         prefs.theme = theme;
                     }
                 }
-                // The key stays `capture` (not `capture_method`) so files
-                // written by earlier versions still load.
-                "capture" => {
-                    if let Some(method) = CaptureMethod::ALL.into_iter().find(|m| m.key() == value)
-                    {
-                        prefs.capture_method = method;
-                    }
-                }
+                // `capture` (the old Live/Still choice) is no longer read:
+                // a pick now takes the first capture method not denied.
+                // Like any unknown key, it's skipped, and dropped on the
+                // next save.
                 _ => {}
             }
         }
@@ -126,11 +96,7 @@ impl Prefs {
     }
 
     fn serialize(&self) -> String {
-        format!(
-            "theme = {}\ncapture = {}\n",
-            self.theme.key(),
-            self.capture_method.key()
-        )
+        format!("theme = {}\n", self.theme.key())
     }
 }
 
@@ -149,10 +115,7 @@ mod tests {
 
     #[test]
     fn serialize_roundtrips() {
-        let prefs = Prefs {
-            theme: Theme::Dark,
-            capture_method: CaptureMethod::Still,
-        };
+        let prefs = Prefs { theme: Theme::Dark };
         assert_eq!(Prefs::parse(&prefs.serialize()), prefs);
     }
 
@@ -161,10 +124,7 @@ mod tests {
         let prefs = Prefs::parse("theme=light\n# comment\ncapture = sideways\nfuture = 1\n");
         assert_eq!(
             prefs,
-            Prefs {
-                theme: Theme::Light,
-                capture_method: CaptureMethod::Live,
-            }
+            Prefs { theme: Theme::Light }
         );
         assert_eq!(Prefs::parse(""), Prefs::default());
     }
