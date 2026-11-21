@@ -91,6 +91,13 @@ struct StreamDiagnostics {
 /// disk is not.
 static SCREENCAST_DECLINED: AtomicBool = AtomicBool::new(false);
 
+/// Clears a "no" given earlier in this run, so the next pick asks for
+/// screen sharing again. Called when the user picks live capture on the
+/// settings page: choosing it there is a clear sign they now want it.
+pub fn forget_refusal() {
+    SCREENCAST_DECLINED.store(false, Ordering::Relaxed);
+}
+
 /// Where the magnifier's pixels come from.
 ///
 /// | | [`Self::Live`] | [`Self::Still`] |

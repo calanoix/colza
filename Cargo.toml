@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Color picker and WCAG contrast checker for Wayland (GNOME/KDE) via xdg-desktop-portal"
 license = "MIT"
+repository = "https://github.com/calanoix/colza"
 
 [dependencies]
 # ashpd 0.13 splits each portal into its own feature, so every module we

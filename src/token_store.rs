@@ -67,3 +67,23 @@ pub fn store(token: &str) {
         );
     }
 }
+
+/// Whether a token is saved, i.e. whether the next screen share will skip
+/// the "which screen?" dialog. Shown on the settings page.
+pub fn exists() -> bool {
+    load().is_some()
+}
+
+/// Deletes the saved token, so the next screen share asks again which
+/// screen to share (and saves a fresh token from that answer). A missing
+/// file already is the desired state, so that error is ignored.
+pub fn clear() {
+    let Some(path) = token_path() else {
+        return;
+    };
+    if let Err(err) = std::fs::remove_file(&path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("colza: could not delete {}: {err}", path.display());
+        }
+    }
+}

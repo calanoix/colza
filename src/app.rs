@@ -1,7 +1,7 @@
 //! Main GUI, styled to match the flax extension (same palette, radii,
 //! spacing and type scale as `panel.css`, light and dark):
 //!
-//! - a 36px toolbar-style header (brand name, light/dark toggle at the right);
+//! - a 36px toolbar-style header (brand name, settings button at the right);
 //! - a body split by a 1px vertical line (like flax's sidebar border):
 //!   - left (white, full height): a WCAG 2.x / APCA segmented control
 //!     with a "swap foreground & background" icon button beside it,
@@ -13,10 +13,15 @@
 //!     OkLCh's L/C/H — plus Alpha, with gradient rails and value
 //!     readouts).
 //!
+//! The settings button swaps the body for a settings page (theme, screen
+//! capture method, text-size shortcuts; version and repository link in
+//! its header), saved by `prefs.rs`. Back, or Escape, returns.
+//!
 //! Picking a color opens the magnifier as a second egui viewport so the
 //! main window stays visible while the loupe is up.
 //!
-//! The theme follows the system (light/dark) until the toggle is used.
+//! The theme follows the system (light/dark) unless set otherwise in the
+//! settings.
 //! The window has a fixed size in points (`WINDOW_SIZE`), scaled as a
 //! whole by the zoom: the desktop's text size (`text_scale.rs`) times the
 //! user's own Ctrl+/Ctrl- zoom. The window is resized to match whenever
@@ -133,8 +138,27 @@ const WINDOW_SIZE: [f32; 2] = [896.0, 386.0];
 const SLIDER_GAP: f32 = 6.0;
 /// Space between the vertical line and the color cards.
 const RIGHT_PAD_LEFT: f32 = 28.0;
-/// Size of the theme toggle in the header.
-const TOGGLE_SIZE: f32 = 28.0;
+/// Size of the icon buttons in the header (settings, back).
+const HEADER_BUTTON_SIZE: f32 = 28.0;
+/// `repository` from Cargo.toml, empty when unset (then the settings
+/// page shows no link rather than a guessed one).
+const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
+
+/// Which page fills the window below the header.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Main,
+    Settings,
+}
+
+/// Stable ids for the two page-switching buttons, so focus can be moved
+/// onto the one that appears when the page changes (see `App::navigate`).
+fn settings_button_id() -> egui::Id {
+    egui::Id::new("colza-settings-button")
+}
+fn back_button_id() -> egui::Id {
+    egui::Id::new("colza-back-button")
+}
 
 /// Stable id for the magnifier's viewport, so the same native window can be
 /// referred to across frames (opened once, updated, then closed).
@@ -650,72 +674,335 @@ fn paint_swap(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     painter.line_segment([p(-5.0, 8.0), p(-9.0, 4.0)], s);
 }
 
-/// Sun icon (shown in dark mode: click to go light), drawn with strokes.
-fn paint_sun(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+/// Gear icon (settings), drawn with strokes: a thick ring for the body
+/// and eight short, thick spokes past it for the teeth.
+fn paint_gear(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let c = rect.center();
-    painter.circle_filled(c, 4.5, color);
-    let stroke = egui::Stroke::new(2.0, color);
+    painter.circle_stroke(c, 5.0, egui::Stroke::new(3.0, color));
+    let teeth = egui::Stroke::new(3.2, color);
     for i in 0..8 {
-        let a = i as f32 * std::f32::consts::FRAC_PI_4;
+        let a = i as f32 * std::f32::consts::FRAC_PI_4 + std::f32::consts::FRAC_PI_8;
         let dir = egui::vec2(a.cos(), a.sin());
-        painter.line_segment([c + dir * 7.5, c + dir * 10.0], stroke);
+        painter.line_segment([c + dir * 6.0, c + dir * 9.0], teeth);
     }
 }
 
-/// Crescent moon icon (shown in light mode: click to go dark). The
-/// crescent is the outer circle minus an offset inner circle; it is built
-/// as a triangle strip between the two arcs (egui can't fill concave paths
-/// reliably) plus a thin outline for smooth edges.
-fn paint_moon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    const R: f32 = 8.5; // outer radius
-    const INNER_R: f32 = 7.2; // inner (cut-out) radius
-    const STEPS: usize = 24;
-
+/// Left arrow (back), like flax's settings header.
+fn paint_back_arrow(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let c = rect.center();
-    // The inner circle is offset toward the upper right.
-    let u = egui::vec2(0.8, -0.6);
-    let d = 6.0_f32;
-    let inner_c = c + u * d;
+    let p = |x: f32, y: f32| c + egui::vec2(x, y);
+    let s = egui::Stroke::new(2.0, color);
+    painter.line_segment([p(-7.0, 0.0), p(7.0, 0.0)], s);
+    painter.line_segment([p(-7.0, 0.0), p(-2.0, -5.0)], s);
+    painter.line_segment([p(-7.0, 0.0), p(-2.0, 5.0)], s);
+}
 
-    // The crescent's tips are where the two circles cross; `a` is the
-    // distance from the outer center to the chord joining them.
-    let a = (R * R - INNER_R * INNER_R + d * d) / (2.0 * d);
-    // Directions are measured from -u, the crescent's "thick" side.
-    let m = (-u.y).atan2(-u.x);
-    let phi = (-a / R).clamp(-1.0, 1.0).acos();
-    let psi = ((d - a) / INNER_R).clamp(-1.0, 1.0).acos();
+/// Frameless, icon-only square button (swap, settings, back): neutral
+/// fill on hover, focus ring when focused. With no visible text, its name
+/// reaches assistive tech through `widget_info` and sighted users through
+/// the tooltip. `id` pins the widget id when focus must be moved onto it
+/// from elsewhere.
+fn icon_button(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    id: Option<egui::Id>,
+    size: f32,
+    label: &str,
+    paint: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
+) -> egui::Response {
+    let (rect, resp) = match id {
+        Some(id) => {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+            (rect, ui.interact(rect, id, egui::Sense::click()))
+        }
+        None => ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click()),
+    };
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
 
-    let mut outer = Vec::with_capacity(STEPS + 1);
-    let mut inner = Vec::with_capacity(STEPS + 1);
-    for i in 0..=STEPS {
-        let t = i as f32 / STEPS as f32;
-        let ao = m - phi + 2.0 * phi * t;
-        let ai = m - psi + 2.0 * psi * t;
-        outer.push(c + egui::vec2(ao.cos(), ao.sin()) * R);
-        inner.push(inner_c + egui::vec2(ai.cos(), ai.sin()) * INNER_R);
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 6.0, ICON_HOVER);
     }
-
-    let mut mesh = egui::Mesh::default();
-    for i in 0..=STEPS {
-        mesh.colored_vertex(outer[i], color);
-        mesh.colored_vertex(inner[i], color);
+    let color = if resp.hovered() { p.text } else { p.text_secondary };
+    paint(ui.painter(), rect, color);
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            6.0,
+            egui::Stroke::new(2.0, p.focus),
+            egui::StrokeKind::Outside,
+        );
     }
-    for i in 0..STEPS as u32 {
-        let o0 = 2 * i;
-        let i0 = 2 * i + 1;
-        let o1 = 2 * i + 2;
-        let i1 = 2 * i + 3;
-        mesh.add_triangle(o0, i0, o1);
-        mesh.add_triangle(i0, i1, o1);
-    }
-    painter.add(egui::Shape::mesh(mesh));
+    resp.on_hover_text(label)
+}
 
-    let mut outline = outer;
-    outline.extend(inner.into_iter().rev());
-    painter.add(egui::Shape::closed_line(
-        outline,
-        egui::Stroke::new(1.0_f32, color),
-    ));
+/// Up/Down on a *closed*, focused ComboBox step through `all` in place,
+/// like a native <select> (clamped, not wrapped); egui's ComboBox has no
+/// keyboard handling of its own besides opening. Left alone while the
+/// list is open: there egui's arrow navigation between the options is
+/// the right behavior. Returns true if `value` changed.
+fn combo_arrow_keys<T: Copy + PartialEq>(
+    ui: &egui::Ui,
+    combo: &egui::Response,
+    open: bool,
+    value: &mut T,
+    all: &[T],
+) -> bool {
+    if !combo.has_focus() || open {
+        return false;
+    }
+    let step: isize = ui.input_mut(|i| {
+        let mut d = 0;
+        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+            d -= 1;
+        }
+        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+            d += 1;
+        }
+        d
+    });
+    if step == 0 {
+        return false;
+    }
+    let i = all.iter().position(|v| v == value).unwrap_or(0) as isize;
+    let next = all[(i + step).clamp(0, all.len() as isize - 1) as usize];
+    let changed = next != *value;
+    *value = next;
+    changed
+}
+
+/// Vertical radio group in flax's style (`.radio-group`): a circle, a
+/// label, and a muted description under it, the whole row clickable.
+/// Returns true if the selection changed.
+///
+/// Accessibility as for [`segmented_control`]: a `RadioGroup` named
+/// `group` holding radio buttons with their checked state; each option's
+/// description is attached as its accessible description, so it's read
+/// after the name rather than as loose text. Arrows move the selection
+/// and focus (wrapping), Space/Enter select.
+fn radio_group<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    group: &str,
+    value: &mut T,
+    options: &[(T, &str, &str)],
+) -> bool {
+    const CIRCLE_R: f32 = 7.0;
+    const TEXT_X: f32 = 26.0;
+
+    ui.scope(|ui| {
+        a11y(ui, ui.unique_id(), |node| {
+            node.set_role(egui::accesskit::Role::RadioGroup);
+            node.set_label(group);
+        });
+        ui.spacing_mut().item_spacing.y = 10.0;
+
+        let base_id = ui.id().with(("radio", group));
+        let ids: Vec<egui::Id> = (0..options.len()).map(|i| base_id.with(i)).collect();
+        let mut selected = options.iter().position(|(v, _, _)| v == value);
+        let before = selected;
+        let width = ui.available_width();
+
+        for (i, (_, label, description)) in options.iter().enumerate() {
+            let label_g = ui.painter().layout_no_wrap(
+                (*label).to_owned(),
+                egui::FontId::proportional(13.0),
+                p.text,
+            );
+            let desc_g = ui.painter().layout(
+                (*description).to_owned(),
+                egui::FontId::proportional(12.0),
+                p.text_secondary,
+                width - TEXT_X,
+            );
+            let height = label_g.size().y + 2.0 + desc_g.size().y;
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+            let resp = ui.interact(rect, ids[i], egui::Sense::click());
+
+            let is_selected = selected == Some(i);
+            resp.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, is_selected, *label)
+            });
+            let desc = (*description).to_owned();
+            a11y(ui, resp.id, |node| node.set_description(desc));
+
+            if resp.clicked() {
+                selected = Some(i);
+            }
+            if resp.has_focus() {
+                let step: isize = ui.input_mut(|inp| {
+                    let mut d = 0;
+                    for k in [egui::Key::ArrowUp, egui::Key::ArrowLeft] {
+                        if inp.consume_key(egui::Modifiers::NONE, k) {
+                            d -= 1;
+                        }
+                    }
+                    for k in [egui::Key::ArrowDown, egui::Key::ArrowRight] {
+                        if inp.consume_key(egui::Modifiers::NONE, k) {
+                            d += 1;
+                        }
+                    }
+                    d
+                });
+                if step != 0 {
+                    let j = (i as isize + step).rem_euclid(options.len() as isize) as usize;
+                    selected = Some(j);
+                    ui.memory_mut(|m| m.request_focus(ids[j]));
+                }
+            }
+
+            // Drawn with this frame's selection, so a click shows at once.
+            let on = selected == Some(i);
+            let center = egui::pos2(rect.left() + CIRCLE_R + 1.0, rect.top() + label_g.size().y / 2.0);
+            let ring = if on {
+                p.accent
+            } else if resp.hovered() {
+                p.text
+            } else {
+                p.text_secondary
+            };
+            ui.painter().circle_stroke(center, CIRCLE_R, egui::Stroke::new(1.5, ring));
+            if on {
+                ui.painter().circle_filled(center, CIRCLE_R - 3.0, p.accent);
+            }
+            let text_x = rect.left() + TEXT_X;
+            let label_h = label_g.size().y;
+            ui.painter().galley(egui::pos2(text_x, rect.top()), label_g, p.text);
+            ui.painter().galley(
+                egui::pos2(text_x, rect.top() + label_h + 2.0),
+                desc_g,
+                p.text_secondary,
+            );
+            if resp.has_focus() {
+                ui.painter().rect_stroke(
+                    rect.expand(4.0),
+                    6.0,
+                    egui::Stroke::new(2.0, p.focus),
+                    egui::StrokeKind::Outside,
+                );
+            }
+        }
+
+        match selected {
+            Some(i) if selected != before => {
+                *value = options[i].0;
+                true
+            }
+            _ => false,
+        }
+    })
+    .inner
+}
+
+/// A key drawn as a keycap, for the keyboard-shortcut list.
+fn keycap(ui: &mut egui::Ui, p: &Palette, key: &str) {
+    egui::Frame::new()
+        .fill(p.bg)
+        .stroke(egui::Stroke::new(1.0_f32, p.border))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(key).size(11.0).family(bold()).color(p.text));
+        });
+}
+
+/// GitHub's official marks, as downloaded from https://github.com/logos
+/// (`github-mark.png` and `github-mark-white.png` in its archive). Kept
+/// unmodified, as GitHub's usage terms require — no recoloring, so the
+/// hover state below changes the background only, never the mark.
+const GITHUB_MARK: &[u8] = include_bytes!("../assets/github-mark.png");
+const GITHUB_MARK_WHITE: &[u8] = include_bytes!("../assets/github-mark-white.png");
+
+/// The mark for the current theme (black on light, white on dark),
+/// decoded and uploaded once, then cached in egui's memory.
+///
+/// Mipmapped because the source is far larger than the ~20pt it's drawn
+/// at: plain linear filtering samples too few source pixels when shrinking
+/// that much, and the edges come out jagged.
+fn github_mark(ctx: &egui::Context, dark: bool) -> Option<egui::TextureHandle> {
+    let id = egui::Id::new(("github-mark", dark));
+    if let Some(tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return Some(tex);
+    }
+    let bytes = if dark { GITHUB_MARK_WHITE } else { GITHUB_MARK };
+    let img = match image::load_from_memory(bytes) {
+        Ok(img) => img.to_rgba8(),
+        Err(err) => {
+            // Only reachable if the asset is replaced by a broken file;
+            // the header then just shows no link.
+            eprintln!("colza: could not decode the GitHub mark: {err}");
+            return None;
+        }
+    };
+    let size = [img.width() as usize, img.height() as usize];
+    let tex = ctx.load_texture(
+        "github-mark",
+        egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()),
+        egui::TextureOptions {
+            mipmap_mode: Some(egui::TextureFilter::Linear),
+            ..egui::TextureOptions::LINEAR
+        },
+    );
+    ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
+    Some(tex)
+}
+
+/// GitHub mark linking to `url`, like flax's header. A link for
+/// assistive tech (it opens a page, it doesn't act on the app), named
+/// since the mark has no text.
+fn github_link(ui: &mut egui::Ui, p: &Palette, url: &str) {
+    const NAME: &str = "colza on GitHub";
+    let Some(tex) = github_mark(ui.ctx(), ui.visuals().dark_mode) else {
+        return;
+    };
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(HEADER_BUTTON_SIZE, HEADER_BUTTON_SIZE),
+        egui::Sense::click(),
+    );
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Link, true, NAME));
+
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 6.0, ICON_HOVER);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let icon = egui::Rect::from_center_size(
+        rect.center(),
+        egui::vec2(20.0 * tex.aspect_ratio(), 20.0),
+    );
+    ui.painter().image(
+        tex.id(),
+        icon,
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE, // no tint: the mark is shown as GitHub ships it
+    );
+    if resp.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            6.0,
+            egui::Stroke::new(2.0, p.focus),
+            egui::StrokeKind::Outside,
+        );
+    }
+    if resp.on_hover_text(format!("{NAME} ({url})")).clicked() {
+        open_in_browser(url);
+    }
+}
+
+/// Opens `url` in the user's browser through `xdg-open`, which every
+/// Linux desktop provides (and which Flatpak routes through the OpenURI
+/// portal). Done here rather than with egui's `open_url` because that
+/// depends on eframe's optional `links` feature, and would silently do
+/// nothing without it. The child is waited on from a thread so it doesn't
+/// linger as a zombie.
+fn open_in_browser(url: &str) {
+    let url = url.to_owned();
+    std::thread::spawn(move || {
+        match std::process::Command::new("xdg-open").arg(&url).spawn() {
+            Ok(mut child) => {
+                let _ = child.wait();
+            }
+            Err(err) => eprintln!("colza: could not open {url}: {err}"),
+        }
+    });
 }
 
 /// Small uppercase tag, like flax's `.best-practice-tag`. Exposes its
@@ -1075,29 +1362,7 @@ impl ColorRowState {
             let name = format!("{label} color format");
             a11y(ui, combo.response.id, |node| node.set_label(name));
 
-            // Closed and focused, Up/Down step through the formats in
-            // place, like a native <select>; egui's ComboBox has no
-            // keyboard handling of its own besides opening. Left alone
-            // while the list is open (`inner` is `Some`): there egui's
-            // arrow navigation between the options is the right behavior.
-            if combo.response.has_focus() && combo.inner.is_none() {
-                let step: isize = ui.input_mut(|i| {
-                    let mut d = 0;
-                    if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-                        d -= 1;
-                    }
-                    if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-                        d += 1;
-                    }
-                    d
-                });
-                if step != 0 {
-                    let all = ColorFormat::ALL;
-                    let i = all.iter().position(|f| f == format).unwrap_or(0) as isize;
-                    // Clamped, not wrapped, as a native <select> does.
-                    *format = all[(i + step).clamp(0, all.len() as isize - 1) as usize];
-                }
-            }
+            combo_arrow_keys(ui, &combo.response, combo.inner.is_some(), format, &ColorFormat::ALL);
         });
         if self.format != before {
             // Re-derived from the 8-bit color, so an out-of-gamut OkLCh
@@ -1287,6 +1552,13 @@ struct App {
     user_zoom: f32,
     /// The zoom the window was last sized for.
     applied_zoom: f32,
+    page: Page,
+    prefs: crate::prefs::Prefs,
+    /// Whether a screencast restore token is saved; read when the
+    /// settings page opens and after "Forget", not every frame.
+    has_token: bool,
+    /// Widget to focus at the start of the next frame (see `navigate`).
+    pending_focus: Option<egui::Id>,
 }
 
 impl Default for App {
@@ -1301,6 +1573,10 @@ impl Default for App {
             text_scale_rx: std::sync::mpsc::channel().1,
             user_zoom: 1.0,
             applied_zoom: 1.0,
+            page: Page::Main,
+            prefs: crate::prefs::Prefs::default(),
+            has_token: false,
+            pending_focus: None,
         }
     }
 }
@@ -1334,17 +1610,29 @@ impl App {
         }
     }
 
-    /// Kicks off the pick flow for `target`: spawns `screencast::open_best()`
-    /// as a task on the shared runtime and sends the resulting
-    /// `ScreenSource` (plus its first frame) back over a channel. Returns
-    /// immediately — nothing here blocks the calling `ui()` frame.
+    /// Kicks off the pick flow for `target`: spawns the capture chosen on
+    /// the settings page as a task on the shared runtime and sends the
+    /// resulting `ScreenSource` (plus its first frame) back over a
+    /// channel. Returns immediately — nothing here blocks the calling
+    /// `ui()` frame.
+    ///
+    /// Live goes through `screencast::open_best()`, which still falls back
+    /// to a screenshot if the user declines the share; Still goes straight
+    /// to the Screenshot portal and never asks for screen sharing.
     fn start_picking(&mut self, target: Target) {
         let (tx, rx) = std::sync::mpsc::channel();
+        let capture = self.prefs.capture;
 
         match crate::runtime::shared() {
             Ok(rt) => {
                 rt.spawn(async move {
-                    let _ = tx.send(crate::screencast::open_best().await);
+                    let result = match capture {
+                        crate::prefs::Capture::Live => crate::screencast::open_best().await,
+                        crate::prefs::Capture::Still => crate::portal::capture_screen()
+                            .await
+                            .map(|image| (ScreenSource::Still, image)),
+                    };
+                    let _ = tx.send(result);
                 });
             }
             Err(err) => {
@@ -1418,11 +1706,10 @@ impl App {
         }
     }
 
-    /// Header toolbar (flax's `.toolbar-brand`): 36px, toolbar background,
-    /// bottom border, brand name on the left and a muted subtitle on the
-    /// right (flax shows "WCAG 2.2 AA" there).
-    /// Returns true when the theme toggle (top right) was activated.
-    fn draw_header(ui: &mut egui::Ui, p: &Palette, dark: bool) -> bool {
+    /// Header toolbar background (flax's `.toolbar-brand`): 36px, toolbar
+    /// background, bottom border; `contents` lays out inside it, left to
+    /// right, vertically centered.
+    fn header_bar<R>(ui: &mut egui::Ui, p: &Palette, contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
         let width = ui.available_width();
         let rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(width, HEADER_HEIGHT));
         ui.painter().rect_filled(rect, 0.0, p.toolbar_bg);
@@ -1431,92 +1718,283 @@ impl App {
             rect.bottom() - 0.5,
             egui::Stroke::new(1.0_f32, p.border),
         );
-
-        let mut toggled = false;
         ui.allocate_ui_with_layout(
             egui::vec2(width, HEADER_HEIGHT),
             egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.add_space(16.0);
-                let title = ui.label(
-                    egui::RichText::new("colza")
+            contents,
+        )
+        .inner
+    }
+
+    /// Main page header: brand name on the left, settings button on the
+    /// right. Returns the settings button's response.
+    fn draw_header(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
+        Self::header_bar(ui, p, |ui| {
+            ui.add_space(16.0);
+            let title = ui.label(
+                egui::RichText::new("colza")
+                    .size(12.0)
+                    .family(bold())
+                    .color(p.text),
+            );
+            mark_heading(ui, title.id, 1, "colza");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(8.0);
+                icon_button(
+                    ui,
+                    p,
+                    Some(settings_button_id()),
+                    HEADER_BUTTON_SIZE,
+                    "Settings",
+                    paint_gear,
+                )
+            })
+            .inner
+        })
+    }
+
+    /// Settings page header, as in flax: back arrow and title on the left;
+    /// version and the GitHub mark linking to the repository on the
+    /// right. Returns the back button's response.
+    fn draw_settings_header(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
+        Self::header_bar(ui, p, |ui| {
+            ui.add_space(8.0);
+            let back = icon_button(
+                ui,
+                p,
+                Some(back_button_id()),
+                HEADER_BUTTON_SIZE,
+                "Back",
+                paint_back_arrow,
+            );
+            ui.add_space(8.0);
+            let title = ui.label(
+                egui::RichText::new("Settings")
+                    .size(12.0)
+                    .family(bold())
+                    .color(p.text),
+            );
+            mark_heading(ui, title.id, 1, "Settings");
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(8.0);
+                if !REPOSITORY.is_empty() {
+                    github_link(ui, p, REPOSITORY);
+                    ui.add_space(8.0);
+                }
+                ui.label(
+                    egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
                         .size(12.0)
                         .family(bold())
                         .color(p.text),
                 );
-                mark_heading(ui, title.id, 1, "colza");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(8.0);
-                    toggled = Self::theme_toggle(ui, p, dark);
+                ui.label(egui::RichText::new("colza: ").size(12.0).color(p.text_secondary));
+            });
+            back
+        })
+    }
+
+    /// Settings page body: Appearance and Text size on the left, Screen
+    /// capture on the right. Saves and applies changes as they're made.
+    fn draw_settings(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let field_label = |ui: &mut egui::Ui, text: &str| {
+            ui.label(egui::RichText::new(text).size(13.0).family(bold()).color(p.text));
+        };
+        let body = |ui: &mut egui::Ui, text: &str| {
+            ui.label(egui::RichText::new(text).size(12.0).color(p.text_secondary));
+        };
+
+        let content = ui.available_rect_before_wrap().shrink(CARD_MARGIN);
+        let top_down = egui::Layout::top_down(egui::Align::Min);
+        let mut changed = false;
+
+        ui.scope_builder(
+            egui::UiBuilder::new().id_salt("settings").max_rect(content).layout(top_down),
+            |ui| {
+                let col_w = ((ui.available_width() - COL_GAP) / 2.0).max(0.0);
+                let size = egui::vec2(col_w, ui.available_height());
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(COL_GAP, COL_GAP);
+
+                    ui.allocate_ui_with_layout(size, top_down, |ui| {
+                        ui.spacing_mut().item_spacing.y = COL_GAP;
+
+                        // Appearance.
+                        card(ui, p, |ui| {
+                            card_title(ui, p, "Appearance", |_| {});
+                            field_label(ui, "Theme");
+                            // Full-width and as tall as flax's <select>.
+                            ui.spacing_mut().interact_size.y = 32.0;
+                            let theme = &mut self.prefs.theme;
+                            let combo = egui::ComboBox::from_id_salt("theme")
+                                .width(ui.available_width())
+                                .selected_text(egui::RichText::new(theme.label()).size(13.0).color(p.text))
+                                .show_ui(ui, |ui| {
+                                    for t in crate::prefs::Theme::ALL {
+                                        if ui
+                                            .selectable_value(theme, t, egui::RichText::new(t.label()).size(13.0))
+                                            .changed()
+                                        {
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                            a11y(ui, combo.response.id, |node| node.set_label("Theme"));
+                            changed |= combo_arrow_keys(
+                                ui,
+                                &combo.response,
+                                combo.inner.is_some(),
+                                theme,
+                                &crate::prefs::Theme::ALL,
+                            );
+                        });
+
+                        // Text size: just the shortcuts. The desktop's own
+                        // size is applied automatically (`text_scale.rs`).
+                        card(ui, p, |ui| {
+                            card_title(ui, p, "Text size", |_| {});
+                            egui::Frame::new()
+                                .fill(p.toolbar_bg)
+                                .stroke(egui::Stroke::new(1.0_f32, p.border))
+                                .corner_radius(6.0)
+                                .inner_margin(12.0)
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    egui::Grid::new("shortcuts")
+                                        .num_columns(2)
+                                        .spacing(egui::vec2(16.0, 8.0))
+                                        .show(ui, |ui| {
+                                            for (key, action) in [
+                                                ("+", "Larger"),
+                                                ("-", "Smaller"),
+                                                ("0", "Reset to system size"),
+                                            ] {
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                                    keycap(ui, p, "Ctrl");
+                                                    keycap(ui, p, key);
+                                                });
+                                                body(ui, action);
+                                                ui.end_row();
+                                            }
+                                        });
+                                });
+                        });
+                    });
+
+                    ui.allocate_ui_with_layout(size, top_down, |ui| {
+                        // Screen capture.
+                        card(ui, p, |ui| {
+                            card_title(ui, p, "Screen capture", |_| {});
+                            body(ui, "colza looks at your screen only while you pick a color.");
+                            ui.add_space(4.0);
+                            field_label(ui, "Capture method");
+                            let before = self.prefs.capture;
+                            if radio_group(
+                                ui,
+                                p,
+                                "Capture method",
+                                &mut self.prefs.capture,
+                                &[
+                                    (
+                                        crate::prefs::Capture::Live,
+                                        "Live (screen sharing)",
+                                        "Follows videos and animations as they play, without \
+                                         the mouse cursor. Your desktop asks once which screen \
+                                         to share.",
+                                    ),
+                                    (
+                                        crate::prefs::Capture::Still,
+                                        "Still image (screenshot)",
+                                        "One screenshot per pick: the image stays frozen while \
+                                         the loupe is open, and shows the mouse cursor.",
+                                    ),
+                                ],
+                            ) {
+                                changed = true;
+                                if self.prefs.capture == crate::prefs::Capture::Live
+                                    && before != crate::prefs::Capture::Live
+                                {
+                                    // Choosing live here is a clear "yes"
+                                    // to a share declined earlier this run.
+                                    crate::screencast::forget_refusal();
+                                }
+                            }
+
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().interact_size.y = 28.0;
+                                let forget = ui.add_enabled(
+                                    self.has_token,
+                                    egui::Button::new(
+                                        egui::RichText::new("Forget shared screen").size(12.0),
+                                    ),
+                                );
+                                if forget.clicked() {
+                                    crate::token_store::clear();
+                                    self.has_token = crate::token_store::exists();
+                                }
+                            });
+                            body(
+                                ui,
+                                if self.has_token {
+                                    "A shared screen is remembered. Forget it to choose \
+                                     another at the next live pick."
+                                } else {
+                                    "No shared screen remembered: the next live pick will \
+                                     ask which screen to share."
+                                },
+                            );
+                        });
+                    });
                 });
             },
         );
-        toggled
+
+        if changed {
+            self.apply_theme(ui.ctx());
+            self.prefs.save();
+        }
     }
 
-    /// Icon-only "swap" button for the summary's header row, frameless
-    /// like the eyedropper and theme toggle. With no visible text, its
-    /// name reaches assistive tech through `widget_info` and sighted
-    /// users through the tooltip. Returns true when activated by pointer
-    /// or keyboard.
+    fn apply_theme(&self, ctx: &egui::Context) {
+        use crate::prefs::Theme;
+        ctx.set_theme(match self.prefs.theme {
+            Theme::System => egui::ThemePreference::System,
+            Theme::Light => egui::ThemePreference::Light,
+            Theme::Dark => egui::ThemePreference::Dark,
+        });
+    }
+
+    /// Switches pages. Focus follows only when the switch came from the
+    /// keyboard (or a screen reader): it lands on the button that leads
+    /// back, so Tab order picks up from the new page, and a screen reader
+    /// announces where the user ended up. After a mouse click, moving
+    /// focus would just paint a focus ring nobody asked for.
+    fn navigate(&mut self, ctx: &egui::Context, to: Page, from_keyboard: bool) {
+        self.page = to;
+        if to == Page::Settings {
+            self.has_token = crate::token_store::exists();
+        }
+        if from_keyboard {
+            // Deferred to the next frame: the target button belongs to the
+            // page that frame will draw, and doesn't exist yet in this one.
+            // Focusing it now would put a focus on a node missing from
+            // this frame's accessibility tree, which a screen reader can't
+            // follow (AccessKit's own consumer rejects such a tree).
+            self.pending_focus = Some(match to {
+                Page::Settings => back_button_id(),
+                Page::Main => settings_button_id(),
+            });
+        }
+        ctx.request_repaint();
+    }
+
+    /// Icon-only "swap" button for the summary's header row. Returns true
+    /// when activated by pointer or keyboard.
     fn swap_button(ui: &mut egui::Ui, p: &Palette) -> bool {
-        const LABEL: &str = "Swap foreground & background";
         // Same height as the segmented control beside it.
-        const SIZE: f32 = 26.0;
-
-        let (rect, resp) =
-            ui.allocate_exact_size(egui::vec2(SIZE, SIZE), egui::Sense::click());
-        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, LABEL));
-
-        if resp.hovered() {
-            ui.painter().rect_filled(rect, 6.0, ICON_HOVER);
-        }
-        let color = if resp.hovered() { p.text } else { p.text_secondary };
-        paint_swap(ui.painter(), rect, color);
-        if resp.has_focus() {
-            ui.painter().rect_stroke(
-                rect,
-                6.0,
-                egui::Stroke::new(2.0, p.focus),
-                egui::StrokeKind::Outside,
-            );
-        }
-
-        resp.on_hover_text(LABEL).clicked()
-    }
-
-    /// Light/dark toggle (header, top right). Shows the icon of the mode it
-    /// switches *to*. Returns true when activated by pointer or keyboard.
-    fn theme_toggle(ui: &mut egui::Ui, p: &Palette, dark: bool) -> bool {
-        let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(TOGGLE_SIZE, TOGGLE_SIZE),
-            egui::Sense::click(),
-        );
-        let label = if dark {
-            "Switch to light mode"
-        } else {
-            "Switch to dark mode"
-        };
-        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
-
-        if resp.hovered() {
-            ui.painter().rect_filled(rect, 6.0, ICON_HOVER);
-        }
-        if dark {
-            paint_sun(ui.painter(), rect, p.text_secondary);
-        } else {
-            paint_moon(ui.painter(), rect, p.text_secondary);
-        }
-        if resp.has_focus() {
-            ui.painter().rect_stroke(
-                rect,
-                6.0,
-                egui::Stroke::new(2.0, p.focus),
-                egui::StrokeKind::Outside,
-            );
-        }
-
-        resp.on_hover_text(label).clicked()
+        icon_button(ui, p, None, 26.0, "Swap foreground & background", paint_swap).clicked()
     }
 
     /// Left section: method switch and swap button, "Aa" preview + ratio
@@ -1640,6 +2118,9 @@ impl eframe::App for App {
         let ctx = &ctx;
 
         self.update_zoom(ctx);
+        if let Some(id) = self.pending_focus.take() {
+            ctx.memory_mut(|m| m.request_focus(id));
+        }
 
         let p = Palette::new(ui.visuals().dark_mode);
         let picking = !matches!(self.mode, Mode::Normal);
@@ -1647,101 +2128,117 @@ impl eframe::App for App {
         let mut swap_requested = false;
 
         let (bg_eff, fg_eff) = self.effective();
-        let method = &mut self.method;
+        let mut nav: Option<(Page, bool)> = None;
 
-        let dark = ui.visuals().dark_mode;
-        let mut toggle_theme = false;
-
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(p.toolbar_bg))
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-
-                toggle_theme = Self::draw_header(ui, &p, dark);
-
-                let body_h = ui.available_height();
-                let top_down = egui::Layout::top_down(egui::Align::Min);
-
-                ui.horizontal_top(|ui| {
+        if self.page == Page::Settings {
+            // Escape goes back, as it would close a dialog — unless it's
+            // closing an open dropdown, which egui handles itself.
+            if !egui::Popup::is_any_open(ctx)
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            {
+                nav = Some((Page::Main, true));
+            }
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(p.toolbar_bg))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                    let back = Self::draw_settings_header(ui, &p);
+                    if back.clicked() {
+                        nav = Some((Page::Main, !back.clicked_by(egui::PointerButton::Primary)));
+                    }
+                    self.draw_settings(ui, &p);
+                });
+        } else {
+            let method = &mut self.method;
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(p.toolbar_bg))
+                .show(ui, |ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
-                    // Left: contrast section, full height, separated from
-                    // the colors by a vertical line (flax's sidebar border).
-                    let (left, _) = ui.allocate_exact_size(
-                        egui::vec2(LEFT_WIDTH, body_h),
-                        egui::Sense::hover(),
-                    );
-                    ui.painter().rect_filled(left, 0.0, p.bg);
-                    ui.painter().vline(
-                        left.right() - 0.5,
-                        left.y_range(),
-                        egui::Stroke::new(1.0_f32, p.border),
-                    );
-                    ui.scope_builder(
-                        egui::UiBuilder::new()
-                            .id_salt("summary")
-                            .max_rect(left.shrink(CARD_MARGIN))
-                            .layout(top_down),
-                        |ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                            if Self::draw_summary(ui, &p, bg_eff, fg_eff, method) {
-                                swap_requested = true;
-                            }
-                        },
-                    );
+                    let settings = Self::draw_header(ui, &p);
+                    if settings.clicked() {
+                        nav = Some((Page::Settings, !settings.clicked_by(egui::PointerButton::Primary)));
+                    }
 
-                    // Right: the two color cards, each as tall as its
-                    // content, with extra room after the vertical line.
-                    let (right, _) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), body_h),
-                        egui::Sense::hover(),
-                    );
-                    let content = egui::Rect::from_min_max(
-                        right.min + egui::vec2(RIGHT_PAD_LEFT, CARD_MARGIN),
-                        right.max - egui::vec2(CARD_MARGIN, CARD_MARGIN),
-                    );
-                    ui.scope_builder(
-                        egui::UiBuilder::new()
-                            .id_salt("colors")
-                            .max_rect(content)
-                            .layout(top_down),
-                        |ui| {
-                            let col_w = ((ui.available_width() - COL_GAP) / 2.0).max(0.0);
-                            let size = egui::vec2(col_w, ui.available_height());
+                    let body_h = ui.available_height();
+                    let top_down = egui::Layout::top_down(egui::Align::Min);
 
-                            ui.horizontal_top(|ui| {
-                                ui.spacing_mut().item_spacing.x = COL_GAP;
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
-                                // Foreground.
-                                ui.allocate_ui_with_layout(size, top_down, |ui| {
-                                    card(ui, &p, |ui| {
-                                        self.fg.ui(ui, &p, picking, || {
-                                            pick_target = Some(Target::Fg)
+                        // Left: contrast section, full height, separated from
+                        // the colors by a vertical line (flax's sidebar border).
+                        let (left, _) = ui.allocate_exact_size(
+                            egui::vec2(LEFT_WIDTH, body_h),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect_filled(left, 0.0, p.bg);
+                        ui.painter().vline(
+                            left.right() - 0.5,
+                            left.y_range(),
+                            egui::Stroke::new(1.0_f32, p.border),
+                        );
+                        ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .id_salt("summary")
+                                .max_rect(left.shrink(CARD_MARGIN))
+                                .layout(top_down),
+                            |ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                                if Self::draw_summary(ui, &p, bg_eff, fg_eff, method) {
+                                    swap_requested = true;
+                                }
+                            },
+                        );
+
+                        // Right: the two color cards, each as tall as its
+                        // content, with extra room after the vertical line.
+                        let (right, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), body_h),
+                            egui::Sense::hover(),
+                        );
+                        let content = egui::Rect::from_min_max(
+                            right.min + egui::vec2(RIGHT_PAD_LEFT, CARD_MARGIN),
+                            right.max - egui::vec2(CARD_MARGIN, CARD_MARGIN),
+                        );
+                        ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .id_salt("colors")
+                                .max_rect(content)
+                                .layout(top_down),
+                            |ui| {
+                                let col_w = ((ui.available_width() - COL_GAP) / 2.0).max(0.0);
+                                let size = egui::vec2(col_w, ui.available_height());
+
+                                ui.horizontal_top(|ui| {
+                                    ui.spacing_mut().item_spacing.x = COL_GAP;
+
+                                    // Foreground.
+                                    ui.allocate_ui_with_layout(size, top_down, |ui| {
+                                        card(ui, &p, |ui| {
+                                            self.fg.ui(ui, &p, picking, || {
+                                                pick_target = Some(Target::Fg)
+                                            });
+                                        });
+                                    });
+
+                                    // Background.
+                                    ui.allocate_ui_with_layout(size, top_down, |ui| {
+                                        card(ui, &p, |ui| {
+                                            self.bg.ui(ui, &p, picking, || {
+                                                pick_target = Some(Target::Bg)
+                                            });
                                         });
                                     });
                                 });
-
-                                // Background.
-                                ui.allocate_ui_with_layout(size, top_down, |ui| {
-                                    card(ui, &p, |ui| {
-                                        self.bg.ui(ui, &p, picking, || {
-                                            pick_target = Some(Target::Bg)
-                                        });
-                                    });
-                                });
-                            });
-                        },
-                    );
+                            },
+                        );
+                    });
                 });
-            });
+        }
 
-        if toggle_theme {
-            ctx.set_theme(if dark {
-                egui::Theme::Light
-            } else {
-                egui::Theme::Dark
-            });
-            ctx.request_repaint();
+        if let Some((to, from_keyboard)) = nav {
+            self.navigate(ctx, to, from_keyboard);
         }
 
         if swap_requested {
@@ -1966,6 +2463,7 @@ pub fn main() -> anyhow::Result<()> {
     // creates the window before the app (with a zoom of 1), hence the size
     // scaled by hand here and the zoom set in the creator below.
     let text_scale = crate::text_scale::read_blocking();
+    let prefs = crate::prefs::Prefs::load();
 
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
@@ -1989,12 +2487,15 @@ pub fn main() -> anyhow::Result<()> {
             let (tx, text_scale_rx) = std::sync::mpsc::channel();
             crate::text_scale::watch(cc.egui_ctx.clone(), tx);
 
-            Ok(Box::new(App {
+            let app = App {
                 text_scale,
                 text_scale_rx,
                 applied_zoom: text_scale,
+                prefs,
                 ..App::default()
-            }))
+            };
+            app.apply_theme(&cc.egui_ctx);
+            Ok(Box::new(app))
         }),
     )
     .map_err(|err| anyhow::anyhow!("eframe failed: {err}"))?;
