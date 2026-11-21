@@ -26,10 +26,13 @@ const HEX_BAND_HEIGHT: f32 = 28.0;
 /// source isn't live.
 const STILL_CAPTION_HEIGHT: f32 = 14.0;
 const LOUPE_OFFSET: f32 = 20.0;
-/// Crosshair geometry, in points: the empty square left around the
-/// picked pixel, and how far each arm reaches from the center.
-const CROSSHAIR_GAP: f32 = 4.0;
-const CROSSHAIR_ARM: f32 = 12.0;
+/// Length of each crosshair arm, in points. Where the arms *start* isn't
+/// a constant: see [`crosshair_gap`].
+const CROSSHAIR_ARM: f32 = 8.0;
+/// Width of the crosshair's black outline (the white core is 1pt).
+const CROSSHAIR_OUTLINE: f32 = 3.0;
+/// Margin around anything the overlay paints, for antialiasing.
+const AA_MARGIN: f32 = 1.0;
 /// How long an area this overlay painted stays masked out of incoming
 /// frames (see [`MagnifierState::accept_frame`]). It must outlast the
 /// capture pipeline's latency — compositor, PipeWire, our thread, the
@@ -99,8 +102,9 @@ impl MagnifierState {
     ///
     /// The cost is that a masked area doesn't update while the overlay
     /// keeps covering it. That is why the crosshair is masked arm by arm
-    /// rather than as one square: the pixel being picked sits in its gap
-    /// and must stay live (a video under the loupe keeps playing).
+    /// rather than as one square, and why its arms start outside the
+    /// sampled grid ([`crosshair_gap`]): every pixel the loupe shows stays
+    /// live (a video under it keeps playing).
     pub fn accept_frame(&mut self, mut frame: RgbImage) {
         let now = Instant::now();
         while self
@@ -411,30 +415,66 @@ impl MagnifierState {
     /// visible, each drawn white over a wider black stroke so it reads on
     /// any background.
     fn draw_crosshair(&mut self, ctx: &egui::Context, painter: &egui::Painter, image_pos: (u32, u32)) {
-        const OUTLINE: f32 = 3.0;
         let c = self.logical_center_of(ctx, image_pos);
-        let arms = [
-            egui::vec2(1.0, 0.0),
-            egui::vec2(-1.0, 0.0),
-            egui::vec2(0.0, 1.0),
-            egui::vec2(0.0, -1.0),
-        ];
-        for dir in arms {
-            // Each arm's footprint, padded 1pt for antialiasing. Stops
-            // short of the center: the gap (and the picked pixel in it)
-            // must stay live — see `accept_frame`.
-            let (a, b) = (c + dir * CROSSHAIR_GAP, c + dir * CROSSHAIR_ARM);
-            self.record_overlay(egui::Rect::from_two_pos(a, b).expand(OUTLINE / 2.0 + 1.0));
+        let gap = crosshair_gap(self.scale.unwrap_or(egui::Vec2::splat(1.0)));
+        for (a, b) in crosshair_arms(c, gap) {
+            self.record_overlay(crosshair_arm_footprint(a, b));
         }
-        for (width, color) in [(OUTLINE, egui::Color32::BLACK), (1.0, egui::Color32::WHITE)] {
-            for dir in arms {
-                painter.line_segment(
-                    [c + dir * CROSSHAIR_GAP, c + dir * CROSSHAIR_ARM],
-                    egui::Stroke::new(width, color),
-                );
+        for (width, color) in [
+            (CROSSHAIR_OUTLINE, egui::Color32::BLACK),
+            (1.0, egui::Color32::WHITE),
+        ] {
+            for (a, b) in crosshair_arms(c, gap) {
+                painter.line_segment([a, b], egui::Stroke::new(width, color));
             }
         }
     }
+}
+
+/// Distance from the crosshair's center to where its arms start, in
+/// points: just far enough that nothing the crosshair paints — outline
+/// and antialiasing included — lands on a pixel the loupe samples.
+///
+/// That's what keeps the whole 9×9 grid live. The ScreenCast stream
+/// films our own overlay, so pixels under the crosshair can't be shown
+/// as they really are; [`MagnifierState::accept_frame`] substitutes the
+/// last clean value for them, which freezes them. With the arms inside
+/// the grid, those frozen cells stood still in the middle of a playing
+/// video. Starting the arms outside it means there is nothing to freeze
+/// while the crosshair holds still. (Moving, it still masks the spots it
+/// just left for a moment, which the motion hides.)
+///
+/// Depends on the HiDPI scale, since the grid's extent is fixed in image
+/// pixels: the outermost sampled pixel reaches `LOUPE_PX / 2 + 0.5` pixels
+/// from the center one's center. The smaller of the two axis scales gives
+/// the larger, safe distance.
+fn crosshair_gap(scale: egui::Vec2) -> f32 {
+    let scale = scale.x.min(scale.y).max(f32::EPSILON);
+    let grid_reach = ((LOUPE_PX / 2) as f32 + 0.5) / scale;
+    // Half a pixel more than strictly needed, so a stroke landing exactly
+    // on a pixel boundary can't bleed into the outermost cell.
+    grid_reach + 0.5 / scale + CROSSHAIR_OUTLINE / 2.0 + AA_MARGIN
+}
+
+/// The four arms as segments, outward from the gap around `center`.
+fn crosshair_arms(center: egui::Pos2, gap: f32) -> [(egui::Pos2, egui::Pos2); 4] {
+    [
+        egui::vec2(1.0, 0.0),
+        egui::vec2(-1.0, 0.0),
+        egui::vec2(0.0, 1.0),
+        egui::vec2(0.0, -1.0),
+    ]
+    .map(|dir| (center + dir * gap, center + dir * (gap + CROSSHAIR_ARM)))
+}
+
+/// Everything an arm from `a` to `b` can paint: the segment widened by
+/// the outline and antialiasing. (Butt caps: nothing goes past `a`/`b`
+/// along the arm but the antialiasing.)
+fn crosshair_arm_footprint(a: egui::Pos2, b: egui::Pos2) -> egui::Rect {
+    egui::Rect::from_two_pos(a, b).expand(CROSSHAIR_OUTLINE / 2.0 + AA_MARGIN)
+}
+
+impl MagnifierState {
 }
 
 /// Result of `MagnifierState::handle_input` for one frame: at most one of
@@ -470,6 +510,30 @@ mod tests {
         state.overlay_history[0].0 -= OVERLAY_MASK_TIME * 2;
         state.accept_frame(solid(250));
         assert_eq!(at(&state, 10, 10), 250);
+    }
+
+    /// The crosshair never paints onto a pixel the loupe samples, at any
+    /// HiDPI scale — so none of the grid gets frozen by the mask.
+    #[test]
+    fn crosshair_stays_off_the_sampled_grid() {
+        for scale in [1.0, 1.25, 1.5, 2.0, 3.0] {
+            let center = egui::pos2(500.5 / scale, 300.5 / scale); // a pixel center
+            let half = (LOUPE_PX / 2) as f32;
+            // The sampled grid, in points: pixel edges, not centers.
+            let grid = egui::Rect::from_center_size(
+                center,
+                egui::Vec2::splat((2.0 * half + 1.0) / scale),
+            );
+            let gap = crosshair_gap(egui::Vec2::splat(scale));
+            for (a, b) in crosshair_arms(center, gap) {
+                let foot = crosshair_arm_footprint(a, b);
+                let overlap = foot.intersect(grid);
+                assert!(
+                    overlap.width() <= 0.0 || overlap.height() <= 0.0,
+                    "scale {scale}: arm {foot:?} overlaps grid {grid:?}"
+                );
+            }
+        }
     }
 
     #[test]
