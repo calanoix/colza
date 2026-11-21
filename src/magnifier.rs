@@ -164,18 +164,18 @@ impl MagnifierState {
     /// screenshot, accounting for the screenshot possibly being a
     /// different resolution than the logical window size (HiDPI).
     pub fn image_pos_for(&self, ctx: &egui::Context, logical: egui::Pos2) -> (u32, u32) {
-        // `Context::screen_rect()` was removed in egui 0.36; the
-        // viewport's rect now lives on `InputState`. Safe to call
-        // `ctx.input()` here: this function is never invoked from inside
-        // another `ctx.input(...)` closure (see the note on
-        // `handle_input` below for why that matters).
+        pixel_at(logical, self.current_scale(ctx))
+    }
+
+    /// Image pixels per window point, per axis, for the viewport `ctx` is
+    /// currently drawing.
+    ///
+    /// `Context::screen_rect()` was removed in egui 0.36; the viewport's
+    /// rect now lives on `InputState`. Must not be called from inside
+    /// another `ctx.input(...)` closure (see the note in `handle_input`).
+    fn current_scale(&self, ctx: &egui::Context) -> egui::Vec2 {
         let screen_rect = ctx.input(|i| i.viewport_rect());
-        let scale_x = self.screenshot.width() as f32 / screen_rect.width().max(1.0);
-        let scale_y = self.screenshot.height() as f32 / screen_rect.height().max(1.0);
-        (
-            (logical.x * scale_x).round().max(0.0) as u32,
-            (logical.y * scale_y).round().max(0.0) as u32,
-        )
+        image_scale(self.screenshot.dimensions(), screen_rect.size())
     }
 
     /// Inverse of [`Self::image_pos_for`]: the window-space center of an
@@ -183,13 +183,7 @@ impl MagnifierState {
     /// `cursor_pos` frames exactly the pixel that will be picked, which
     /// matters on HiDPI, where one logical point spans several pixels.
     fn logical_center_of(&self, ctx: &egui::Context, image_pos: (u32, u32)) -> egui::Pos2 {
-        let screen_rect = ctx.input(|i| i.viewport_rect());
-        let scale_x = self.screenshot.width() as f32 / screen_rect.width().max(1.0);
-        let scale_y = self.screenshot.height() as f32 / screen_rect.height().max(1.0);
-        egui::pos2(
-            (image_pos.0 as f32 + 0.5) / scale_x,
-            (image_pos.1 as f32 + 0.5) / scale_y,
-        )
+        pixel_center(image_pos, self.current_scale(ctx))
     }
 
     /// Reads pointer/keyboard input for this frame: updates `cursor_pos`
@@ -200,6 +194,7 @@ impl MagnifierState {
     pub fn handle_input(&mut self, ctx: &egui::Context) -> MagnifierInput {
         let mut clicked_or_entered = false;
         let mut cancelled = false;
+        let mut nudge: (i64, i64) = (0, 0);
 
         // `ctx.input(...)` holds an internal lock on egui's input state for
         // the duration of the closure. Calling anything that itself needs
@@ -225,22 +220,19 @@ impl MagnifierState {
                 }
             }
 
-            // Arrow keys nudge the cursor by one logical pixel.
-            let mut delta = egui::Vec2::ZERO;
+            // Arrow keys: collected here, applied after the closure,
+            // since that needs the scale and so `ctx` again.
             if input.key_pressed(egui::Key::ArrowLeft) {
-                delta.x -= 1.0;
+                nudge.0 -= 1;
             }
             if input.key_pressed(egui::Key::ArrowRight) {
-                delta.x += 1.0;
+                nudge.0 += 1;
             }
             if input.key_pressed(egui::Key::ArrowUp) {
-                delta.y -= 1.0;
+                nudge.1 -= 1;
             }
             if input.key_pressed(egui::Key::ArrowDown) {
-                delta.y += 1.0;
-            }
-            if delta != egui::Vec2::ZERO {
-                self.cursor_pos += delta;
+                nudge.1 += 1;
             }
 
             if input.pointer.primary_clicked() || input.key_pressed(egui::Key::Enter) {
@@ -250,6 +242,19 @@ impl MagnifierState {
                 cancelled = true;
             }
         });
+
+        // Arrow keys move the picked pixel by exactly one *image* pixel,
+        // then put the cursor at that pixel's center. Stepping one window
+        // point instead (as this used to) moves 1.25 pixels at 125%
+        // display scaling — so after rounding, sometimes 1 pixel and
+        // sometimes 2 — and 2 pixels at 200%, skipping every other one.
+        if nudge != (0, 0) {
+            let scale = self.current_scale(ctx);
+            let (x, y) = pixel_at(self.cursor_pos, scale);
+            let (w, h) = self.screenshot.dimensions();
+            let step = |v: u32, d: i64, len: u32| (v as i64 + d).clamp(0, len.max(1) as i64 - 1) as u32;
+            self.cursor_pos = pixel_center((step(x, nudge.0, w), step(y, nudge.1, h)), scale);
+        }
 
         let picked = if clicked_or_entered {
             let image_pos = self.image_pos_for(ctx, self.cursor_pos);
@@ -264,10 +269,7 @@ impl MagnifierState {
     pub fn draw(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let painter = ui.painter();
         let screen_rect = ctx.input(|i| i.viewport_rect());
-        self.scale = Some(egui::vec2(
-            self.screenshot.width() as f32 / screen_rect.width().max(1.0),
-            self.screenshot.height() as f32 / screen_rect.height().max(1.0),
-        ));
+        self.scale = Some(image_scale(self.screenshot.dimensions(), screen_rect.size()));
 
         let cursor = self.cursor_pos;
         let half = (LOUPE_PX / 2) as i64;
@@ -477,6 +479,35 @@ fn crosshair_arm_footprint(a: egui::Pos2, b: egui::Pos2) -> egui::Rect {
 impl MagnifierState {
 }
 
+/// Image pixels per window point, per axis: how much bigger the captured
+/// image is than the window (1.25 at 125% display scaling, and so on).
+fn image_scale((w, h): (u32, u32), viewport: egui::Vec2) -> egui::Vec2 {
+    egui::vec2(
+        w as f32 / viewport.x.max(1.0),
+        h as f32 / viewport.y.max(1.0),
+    )
+}
+
+/// The image pixel under window point `logical`.
+///
+/// Truncated, not rounded: pixel `i` covers `[i, i + 1)` in image space,
+/// so a point anywhere inside it maps to `i`. Rounding (as this once did)
+/// picked the next pixel whenever the pointer sat in the right or bottom
+/// half of one, and disagreed with [`pixel_center`], so the crosshair and
+/// the picked pixel could be half a pixel apart.
+fn pixel_at(logical: egui::Pos2, scale: egui::Vec2) -> (u32, u32) {
+    (
+        (logical.x * scale.x).floor().max(0.0) as u32,
+        (logical.y * scale.y).floor().max(0.0) as u32,
+    )
+}
+
+/// The window point at the center of an image pixel; the inverse of
+/// [`pixel_at`].
+fn pixel_center((x, y): (u32, u32), scale: egui::Vec2) -> egui::Pos2 {
+    egui::pos2((x as f32 + 0.5) / scale.x, (y as f32 + 0.5) / scale.y)
+}
+
 /// Result of `MagnifierState::handle_input` for one frame: at most one of
 /// these is set (a click/Enter picks, Esc cancels).
 pub struct MagnifierInput {
@@ -534,6 +565,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// At any display scale, `pixel_at` of a pixel's center is that
+    /// pixel, so one arrow press (pixel +1, then its center) moves exactly
+    /// one pixel — the bug was 1 or 2 at 125%.
+    #[test]
+    fn pixel_center_roundtrips_at_fractional_scales() {
+        for s in [1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 3.0] {
+            let scale = egui::Vec2::splat(s);
+            for x in 0..4000u32 {
+                assert_eq!(pixel_at(pixel_center((x, x), scale), scale), (x, x), "scale {s}");
+            }
+        }
+    }
+
+    #[test]
+    fn pixel_at_truncates() {
+        let scale = egui::Vec2::splat(1.25);
+        // Point 10 → image 12.5: inside pixel 12, not "rounded" to 13.
+        assert_eq!(pixel_at(egui::pos2(10.0, 10.0), scale), (12, 12));
+        assert_eq!(pixel_at(egui::pos2(-3.0, 0.0), scale), (0, 0));
     }
 
     #[test]
