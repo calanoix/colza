@@ -1,8 +1,8 @@
 //! On-disk storage for the ScreenCast portal's restore token.
 //!
 //! `PersistMode` alone doesn't stop the compositor from asking "which
-//! screen do you want to share?" on every launch — persistence is a
-//! two-part handshake: request it via `select_sources(..., persist_mode)`,
+//! screen do you want to share?" on every launch: persistence is a
+//! two-part handshake. Request it via `select_sources(..., persist_mode)`,
 //! then pass the `restore_token` that `start()` returns back into the next
 //! `select_sources` call to skip the dialog. Skipping that second part
 //! leaves the grant unnamed server-side, so the dialog appears every time
@@ -16,13 +16,14 @@
 //! Nothing here returns an error to the caller. A missing, unreadable,
 //! corrupt or stale token just means the user sees the picker dialog once
 //! more and a fresh token gets saved from that run. Write failures are
-//! reported to stderr and otherwise ignored.
+//! reported to stderr and otherwise ignored. `prefs.rs` follows the same
+//! policy.
 
 use std::path::PathBuf;
 
 /// `$XDG_CONFIG_HOME/colza/screencast-restore-token`, falling back to
-/// `$HOME/.config/...` per the XDG basedir spec. `None` if neither
-/// variable is set, in which case the app simply operates tokenless.
+/// `$HOME/.config` per the XDG basedir spec. `None` if neither variable
+/// is set, in which case the app simply operates tokenless.
 fn token_path() -> Option<PathBuf> {
     let dir = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),

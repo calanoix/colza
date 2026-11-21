@@ -3,7 +3,7 @@
 //! egui gets the system theme from winit, which on Wayland doesn't know
 //! it: winit 0.30's `Window::theme()` there only returns the theme of its
 //! own client-side decorations, `None` unless set. egui then falls back
-//! to `Options::fallback_theme`, which defaults to dark — so on a light
+//! to `Options::fallback_theme`, which defaults to dark, so on a light
 //! Plasma (Breeze), colza came up dark. (X11 is no better: winit returns
 //! `None` there too.)
 //!
@@ -40,9 +40,9 @@ fn theme_for(scheme: ColorScheme) -> egui::Theme {
     }
 }
 
-/// The value of `color-scheme`, as sent in a change signal.
+/// The theme for a `color-scheme` value, as sent in a change signal.
 fn theme_for_value(value: &Value) -> Option<egui::Theme> {
-    let n = match value {
+    let scheme = match value {
         Value::U32(n) => *n,
         // One more variant layer, as `text_scale::watch` also tolerates.
         Value::Value(inner) => match &**inner {
@@ -51,14 +51,14 @@ fn theme_for_value(value: &Value) -> Option<egui::Theme> {
         },
         _ => return None,
     };
-    Some(if n == 1 { egui::Theme::Dark } else { egui::Theme::Light })
+    Some(if scheme == 1 { egui::Theme::Dark } else { egui::Theme::Light })
 }
 
 /// The desktop's preference, read once at startup so the first frame
 /// already has the right colors. Light on any failure; blocks for at most
 /// [`STARTUP_TIMEOUT`].
 ///
-/// Must be called outside any async context (`runtime::shared` rule).
+/// Must be called outside any async context (see `runtime::shared`).
 pub fn read_blocking() -> egui::Theme {
     let Ok(rt) = crate::runtime::shared() else {
         return egui::Theme::Light;
@@ -114,7 +114,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn schemes() {
+    fn color_schemes() {
         assert_eq!(theme_for(ColorScheme::PreferDark), egui::Theme::Dark);
         assert_eq!(theme_for(ColorScheme::PreferLight), egui::Theme::Light);
         assert_eq!(theme_for(ColorScheme::NoPreference), egui::Theme::Light);

@@ -32,6 +32,7 @@ impl Theme {
         }
     }
 
+    /// The value written to the settings file.
     fn key(self) -> &'static str {
         match self {
             Self::System => "system",
@@ -42,8 +43,11 @@ impl Theme {
 }
 
 /// Which portal supplies the image under the loupe.
+///
+/// Named `CaptureMethod` rather than `Capture` to keep it apart from
+/// `screencast::Capture`, the live session itself.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum Capture {
+pub enum CaptureMethod {
     /// `ScreenCast` + PipeWire: live, cursor hidden.
     #[default]
     Live,
@@ -51,7 +55,10 @@ pub enum Capture {
     Still,
 }
 
-impl Capture {
+impl CaptureMethod {
+    pub const ALL: [Self; 2] = [Self::Live, Self::Still];
+
+    /// The value written to the settings file.
     fn key(self) -> &'static str {
         match self {
             Self::Live => "live",
@@ -63,19 +70,19 @@ impl Capture {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Prefs {
     pub theme: Theme,
-    pub capture: Capture,
+    pub capture_method: CaptureMethod,
 }
 
 impl Prefs {
     pub fn load() -> Self {
-        path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
+        settings_path()
+            .and_then(|path| std::fs::read_to_string(path).ok())
             .map(|text| Self::parse(&text))
             .unwrap_or_default()
     }
 
     pub fn save(&self) {
-        let Some(path) = path() else {
+        let Some(path) = settings_path() else {
             return;
         };
         if let Some(parent) = path.parent() {
@@ -100,16 +107,16 @@ impl Prefs {
             let value = value.trim();
             match key.trim() {
                 "theme" => {
-                    if let Some(t) = Theme::ALL.into_iter().find(|t| t.key() == value) {
-                        prefs.theme = t;
+                    if let Some(theme) = Theme::ALL.into_iter().find(|t| t.key() == value) {
+                        prefs.theme = theme;
                     }
                 }
+                // The key stays `capture` (not `capture_method`) so files
+                // written by earlier versions still load.
                 "capture" => {
-                    if let Some(c) = [Capture::Live, Capture::Still]
-                        .into_iter()
-                        .find(|c| c.key() == value)
+                    if let Some(method) = CaptureMethod::ALL.into_iter().find(|m| m.key() == value)
                     {
-                        prefs.capture = c;
+                        prefs.capture_method = method;
                     }
                 }
                 _ => {}
@@ -122,13 +129,13 @@ impl Prefs {
         format!(
             "theme = {}\ncapture = {}\n",
             self.theme.key(),
-            self.capture.key()
+            self.capture_method.key()
         )
     }
 }
 
 /// `$XDG_CONFIG_HOME/colza/settings`, falling back to `$HOME/.config`.
-fn path() -> Option<PathBuf> {
+fn settings_path() -> Option<PathBuf> {
     let dir = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
@@ -141,15 +148,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip() {
-        let prefs = Prefs { theme: Theme::Dark, capture: Capture::Still };
+    fn serialize_roundtrips() {
+        let prefs = Prefs {
+            theme: Theme::Dark,
+            capture_method: CaptureMethod::Still,
+        };
         assert_eq!(Prefs::parse(&prefs.serialize()), prefs);
     }
 
     #[test]
-    fn tolerant_parse() {
-        let p = Prefs::parse("theme=light\n# comment\ncapture = sideways\nfuture = 1\n");
-        assert_eq!(p, Prefs { theme: Theme::Light, capture: Capture::Live });
+    fn parse_is_tolerant() {
+        let prefs = Prefs::parse("theme=light\n# comment\ncapture = sideways\nfuture = 1\n");
+        assert_eq!(
+            prefs,
+            Prefs {
+                theme: Theme::Light,
+                capture_method: CaptureMethod::Live,
+            }
+        );
         assert_eq!(Prefs::parse(""), Prefs::default());
     }
 }

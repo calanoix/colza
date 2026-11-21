@@ -10,11 +10,13 @@
 //! keeps pointing at the first runtime's now-dead reactor, causing
 //! "there is no reactor running" panics.
 //!
-//! The runtime is multi-threaded rather than `current_thread` for two
-//! reasons: its reactor and timer keep running on worker threads between
-//! calls instead of only while someone is inside `block_on`, and it has a
-//! blocking pool that `screencast.rs` uses for PipeWire's blocking
-//! mainloop.
+//! The runtime is multi-threaded rather than `current_thread` so its
+//! reactor and timers keep running on worker threads between calls,
+//! instead of only while someone is inside `block_on`: the long-lived
+//! portal watchers (`text_scale::watch`, `system_theme::watch`) and the
+//! session cleanup in `screencast::Capture`'s `Drop` are spawned onto it
+//! and never block on anything. (PipeWire's blocking mainloop doesn't run
+//! here: `screencast.rs` gives it its own OS thread.)
 
 use std::sync::OnceLock;
 use tokio::runtime::Runtime;
@@ -23,7 +25,7 @@ use tokio::runtime::Runtime;
 ///
 /// Safe to call from any thread, and safe to `block_on` from several
 /// threads at once. Do NOT call it from inside an async task and then
-/// `block_on` — that deadlocks, as with any runtime.
+/// `block_on`: that deadlocks, as with any runtime.
 pub fn shared() -> anyhow::Result<&'static Runtime> {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
@@ -34,8 +36,8 @@ pub fn shared() -> anyhow::Result<&'static Runtime> {
     // Built outside `get_or_init` so a failure to build can be reported as
     // an error instead of panicking inside the initializer. If another
     // thread wins the race, this one's runtime is dropped here having
-    // never run a task, which is fine and only legal because we are not
-    // inside an async context.
+    // never run a task, which is fine, and only legal because this is not
+    // an async context.
     let rt = Runtime::new()?;
     Ok(RUNTIME.get_or_init(|| rt))
 }

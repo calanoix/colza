@@ -17,7 +17,7 @@
 //! kdeglobals group under that prefix, and re-emits `font` whenever the
 //! Fonts settings page applies a change.)
 //!
-//! Every failure means factor 1.0 — no portal, another desktop, or a
+//! Every failure means factor 1.0: no portal, another desktop, or a
 //! Plasma whose font was never changed from the default (the key is then
 //! absent from kdeglobals, and the portal reports it as missing). All
 //! three have the same right answer, so they aren't told apart.
@@ -69,7 +69,7 @@ pub fn factor_from_qfont(font: &str) -> Option<f32> {
 /// so the window opens at the right size instead of visibly growing.
 /// Blocks for at most [`STARTUP_TIMEOUT`]; 1.0 on any failure.
 ///
-/// Must be called outside any async context (`runtime::shared` rule).
+/// Must be called outside any async context (see `runtime::shared`).
 pub fn read_blocking() -> f32 {
     let Ok(rt) = crate::runtime::shared() else {
         return 1.0;
@@ -106,7 +106,7 @@ pub fn watch(ctx: egui::Context, tx: Sender<f32>) {
         // The unfiltered stream, filtered here, rather than ashpd's
         // `receive_setting_changed_with_args::<String>`: that one converts
         // the value directly, and fails if the backend wraps the string in
-        // one more variant layer — which `read()` tolerates and is a
+        // one more variant layer, which `read()` tolerates and is a
         // legitimate encoding of a `v` argument.
         let Ok(mut changes) = settings.receive_setting_changed().await else {
             return;
@@ -124,11 +124,11 @@ pub fn watch(ctx: egui::Context, tx: Sender<f32>) {
                 _ => continue,
             };
             // A font reset to the default comes back as the default size,
-            // so `None` here is only a malformed string: keep the
-            // current factor rather than guess.
+            // so `None` here is only a malformed string: keep the current
+            // factor rather than guess.
             if let Some(factor) = factor_from_qfont(&font) {
                 if tx.send(factor).is_err() {
-                    return; // UI gone: the app is shutting down.
+                    return; // the UI is gone: the app is shutting down
                 }
                 ctx.request_repaint();
             }

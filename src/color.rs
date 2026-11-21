@@ -5,10 +5,10 @@
 //! unit-testable and reusable independently of the GUI.
 //!
 //! `Rgb` (8-bit sRGB) is the one color that is ever *stored*: it's what
-//! the screen gives us and what WCAG's math is defined on. `Hsl` and
-//! `Oklch` are views onto it, converted on demand, and they use `f64`
-//! throughout so a round trip through them doesn't lose anything before
-//! the final rounding back to 8 bits.
+//! the screen gives and what WCAG's math is defined on. `Hsl` and `Oklch`
+//! are views onto it, converted on demand, and they use `f64` throughout
+//! so a round trip through them doesn't lose anything before the final
+//! rounding back to 8 bits.
 
 use std::fmt;
 
@@ -41,8 +41,8 @@ impl Rgb {
 
     /// Builds a color from channels in `[0, 1]` (rounded, clamped).
     pub fn from_unit_floats(r: f64, g: f64, b: f64) -> Self {
-        let q = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
-        Self::new(q(r), q(g), q(b))
+        let quantize = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+        Self::new(quantize(r), quantize(g), quantize(b))
     }
 
     /// Channels in `[0, 1]`, still sRGB-encoded (gamma), not linear.
@@ -50,11 +50,21 @@ impl Rgb {
         [self.r, self.g, self.b].map(|c| c as f64 / 255.0)
     }
 
-    /// Relative luminance per WCAG 2.x, using sRGB -> linear conversion.
+    /// Relative luminance per WCAG 2.x, using the sRGB → linear conversion.
     /// https://www.w3.org/TR/WCAG21/#dfn-relative-luminance
     pub fn relative_luminance(self) -> f64 {
         let [r, g, b] = self.to_unit_floats().map(srgb_to_linear);
         0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+
+    /// APCA's screen luminance estimate. Deliberately *not*
+    /// [`Self::relative_luminance`]: APCA uses a plain 2.4 power curve
+    /// (no linear toe) and slightly different coefficients, to model a
+    /// real monitor rather than the sRGB spec. Mixing the two up shifts
+    /// Lc by several points on dark colors.
+    fn apca_y(self) -> f64 {
+        let channel = |c: u8| (c as f64 / 255.0).powf(2.4);
+        0.2126729 * channel(self.r) + 0.7151522 * channel(self.g) + 0.0721750 * channel(self.b)
     }
 
     pub fn to_hsl(self) -> Hsl {
@@ -82,8 +92,8 @@ impl Rgb {
         Hsl { h, s, l }
     }
 
-    /// HSL covers exactly the sRGB cube, so unlike `from_oklch` there is
-    /// no gamut to map into — only rounding to 8 bits.
+    /// HSL covers exactly the sRGB cube, so unlike `from_oklch_mapped`
+    /// there is no gamut to map into, only rounding to 8 bits.
     pub fn from_hsl(hsl: Hsl) -> Self {
         let Hsl { h, s, l } = hsl;
         let (s, l) = (s.clamp(0.0, 1.0), l.clamp(0.0, 1.0));
@@ -102,8 +112,8 @@ impl Rgb {
         let c = (a * a + b * b).sqrt();
         // Grays come out of the matrices with a tiny nonzero chroma
         // (~1e-8) whose angle is pure rounding noise. Reporting it would
-        // make the hue slider jump around for neutral colors, so treat
-        // anything this small as achromatic, as CSS does with `none`.
+        // make the hue slider jump around for neutral colors, so anything
+        // this small is treated as achromatic, as CSS does with `none`.
         if c < ACHROMATIC_CHROMA {
             return Oklch { l, c: 0.0, h: 0.0 };
         }
@@ -117,14 +127,14 @@ impl Rgb {
     /// Most of the OkLCh space lies outside sRGB (high chroma at most
     /// hues, and anything bright *and* saturated). Clamping each channel
     /// independently would be the obvious fix, but it visibly shifts hue
-    /// and lightness — a saturated blue slides toward purple. Instead
-    /// this follows CSS Color 4's gamut-mapping algorithm, i.e. what a
-    /// browser does with the same `oklch()`: keep L and h, lower chroma
-    /// until the color fits.
+    /// and lightness: a saturated blue slides toward purple. Instead this
+    /// follows CSS Color 4's gamut-mapping algorithm, i.e. what a browser
+    /// does with the same `oklch()`: keep L and h, lower chroma until the
+    /// color fits.
     /// https://www.w3.org/TR/css-color-4/#binsearch
     ///
     /// "Really" outside because colors on the gamut's surface routinely
-    /// come back a hair outside it — a channel at -0.0004 — just from
+    /// come back a hair outside it (a channel at -0.0004) just from
     /// rounding (the decimals of the text field, or float noise). Those
     /// count as in gamut: off by less than half an 8-bit step, they
     /// quantize to the same color as their clipped version, so mapping
@@ -223,17 +233,17 @@ impl Hsl {
     /// One decimal everywhere is the least that survives a round trip
     /// (measured over all 16.7 M colors; see the exhaustive test below).
     /// With whole numbers, ~3.6 M HSL triples can't name 16.7 M sRGB
-    /// colors, so copying the text and pasting it back — here or in a
-    /// browser — would land on a neighbor, and near a threshold that can
+    /// colors, so copying the text and pasting it back (here or in a
+    /// browser) would land on a neighbor, and near a threshold that can
     /// flip a pass into a fail. Trailing zeros are dropped, so typical
     /// values still read `hsl(210, 50%, 40%)`.
     pub fn to_css(self) -> String {
         let h = normalize_hue(self.h, 1);
         format!(
             "hsl({}, {}%, {}%)",
-            fmt_num(h, 1),
-            fmt_num(self.s * 100.0, 1),
-            fmt_num(self.l * 100.0, 1)
+            format_number(h, 1),
+            format_number(self.s * 100.0, 1),
+            format_number(self.l * 100.0, 1)
         )
     }
 
@@ -263,7 +273,7 @@ impl Hsl {
 /// two colors with the same OkLCh `l` look about equally light, which is
 /// a much better guide when hunting for a passing contrast than HSL's
 /// `l`, where yellow and blue at "50%" are worlds apart. (It is still not
-/// WCAG's luminance — the ratio shown is the only authority.)
+/// WCAG's luminance: the ratio shown is the only authority.)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Oklch {
     pub l: f64,
@@ -288,9 +298,9 @@ impl Oklch {
         let h = if c == 0.0 { 0.0 } else { normalize_hue(self.h, 2) };
         format!(
             "oklch({}% {} {})",
-            fmt_num(self.l * 100.0, 2),
-            fmt_num(c, 5),
-            fmt_num(h, 2)
+            format_number(self.l * 100.0, 2),
+            format_number(c, 5),
+            format_number(h, 2)
         )
     }
 
@@ -340,10 +350,11 @@ pub fn contrast_ratio(a: Rgb, b: Rgb) -> f64 {
 /// checked against its own test values below.
 ///
 /// Unlike the WCAG ratio, the order matters: APCA models text and its
-/// background differently, and the sign gives the polarity — positive
-/// for dark text on a light background, negative for light on dark. The
-/// level thresholds apply to the magnitude.
+/// background differently, and the sign gives the polarity: positive for
+/// dark text on a light background, negative for light on dark. The level
+/// thresholds apply to the magnitude.
 pub fn apca_contrast(text: Rgb, bg: Rgb) -> f64 {
+    // Names as in the reference implementation, to ease comparing.
     const BLK_THRS: f64 = 0.022;
     const BLK_CLMP: f64 = 1.414;
     const DELTA_Y_MIN: f64 = 0.0005;
@@ -356,34 +367,22 @@ pub fn apca_contrast(text: Rgb, bg: Rgb) -> f64 {
     let soft_clamp = |y: f64| {
         if y > BLK_THRS { y } else { y + (BLK_THRS - y).powf(BLK_CLMP) }
     };
-    let txt = soft_clamp(text.apca_y());
-    let bg = soft_clamp(bg.apca_y());
+    let text_y = soft_clamp(text.apca_y());
+    let bg_y = soft_clamp(bg.apca_y());
 
-    if (bg - txt).abs() < DELTA_Y_MIN {
+    if (bg_y - text_y).abs() < DELTA_Y_MIN {
         return 0.0;
     }
-    let lc = if bg > txt {
+    let lc = if bg_y > text_y {
         // Normal polarity: dark text on light.
-        let sapc = (bg.powf(0.56) - txt.powf(0.57)) * SCALE;
+        let sapc = (bg_y.powf(0.56) - text_y.powf(0.57)) * SCALE;
         if sapc < LO_CLIP { 0.0 } else { sapc - LO_OFFSET }
     } else {
         // Reverse polarity: light text on dark.
-        let sapc = (bg.powf(0.65) - txt.powf(0.62)) * SCALE;
+        let sapc = (bg_y.powf(0.65) - text_y.powf(0.62)) * SCALE;
         if sapc > -LO_CLIP { 0.0 } else { sapc + LO_OFFSET }
     };
     lc * 100.0
-}
-
-impl Rgb {
-    /// APCA's screen luminance estimate. Deliberately *not*
-    /// [`Self::relative_luminance`]: APCA uses a plain 2.4 power curve
-    /// (no linear toe) and slightly different coefficients, to model a
-    /// real monitor rather than the sRGB spec. Mixing the two up shifts
-    /// Lc by several points on dark colors.
-    fn apca_y(self) -> f64 {
-        let ch = |c: u8| (c as f64 / 255.0).powf(2.4);
-        0.2126729 * ch(self.r) + 0.7151522 * ch(self.g) + 0.0721750 * ch(self.b)
-    }
 }
 
 fn srgb_to_linear(c: f64) -> f64 {
@@ -403,8 +402,8 @@ fn linear_to_srgb(c: f64) -> f64 {
 }
 
 // Matrices from Björn Ottosson, "A perceptual color space for image
-// processing" (https://bottosson.github.io/posts/oklab/) — the same
-// space CSS's `oklch()` is defined on.
+// processing" (https://bottosson.github.io/posts/oklab/), the same space
+// CSS's `oklch()` is defined on.
 
 fn linear_srgb_to_oklab([r, g, b]: [f64; 3]) -> [f64; 3] {
     let l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b;
@@ -468,6 +467,7 @@ fn parse_hue(s: &str) -> Option<f64> {
     n.is_finite().then(|| n.rem_euclid(360.0))
 }
 
+/// A number with an optional `%` sign, kept in percent.
 fn parse_percent(s: &str) -> Option<f64> {
     let n = s.strip_suffix('%').unwrap_or(s).trim().parse::<f64>().ok()?;
     n.is_finite().then_some(n)
@@ -479,7 +479,7 @@ fn round_to(v: f64, decimals: i32) -> f64 {
 }
 
 /// Hue rounded for display, with a value that rounds up to 360 shown as 0
-/// (359.97 -> "0", not "360").
+/// (359.97 → "0", not "360").
 fn normalize_hue(h: f64, decimals: i32) -> f64 {
     let h = round_to(h.rem_euclid(360.0), decimals);
     if h >= 360.0 { 0.0 } else { h }
@@ -487,7 +487,7 @@ fn normalize_hue(h: f64, decimals: i32) -> f64 {
 
 /// `v` with at most `decimals` decimals and no trailing zeros, so the
 /// field reads `50%` rather than `50.0%`. Never prints `-0`.
-pub fn fmt_num(v: f64, decimals: usize) -> String {
+pub fn format_number(v: f64, decimals: usize) -> String {
     let s = format!("{:.*}", decimals, v);
     let s = if s.contains('.') {
         s.trim_end_matches('0').trim_end_matches('.')
@@ -501,8 +501,10 @@ pub fn fmt_num(v: f64, decimals: usize) -> String {
 mod tests {
     use super::*;
 
+    // --- Hex and WCAG 2.x ---
+
     #[test]
-    fn hex_roundtrip() {
+    fn hex_roundtrips() {
         let c = Rgb::new(0x1A, 0x2B, 0x3C);
         assert_eq!(c.to_hex(), "#1A2B3C");
         assert_eq!(Rgb::from_hex("#1A2B3C").unwrap(), c);
@@ -541,6 +543,8 @@ mod tests {
         assert_eq!(c, Rgb::new(255, 0, 128));
     }
 
+    // --- APCA ---
+
     /// The reference implementation's own test pairs (apca-w3 0.1.9,
     /// `test/index.js`), text first.
     #[test]
@@ -550,7 +554,7 @@ mod tests {
             let d: Vec<u8> = s.bytes().map(|b| (b as char).to_digit(16).unwrap() as u8 * 17).collect();
             Rgb::new(d[0], d[1], d[2])
         };
-        for (txt, bg, want) in [
+        for (text, bg, want) in [
             ("#888", "#fff", 63.056469930209424),
             ("#fff", "#888", -68.54146436644962),
             ("#000", "#aaa", 58.146262578561334),
@@ -560,8 +564,8 @@ mod tests {
             ("#123", "#444", 8.32326136957393),
             ("#444", "#123", -7.526878460278154),
         ] {
-            let got = apca_contrast(hex(txt), hex(bg));
-            assert!((got - want).abs() < 1e-9, "{txt} on {bg}: {got} != {want}");
+            let got = apca_contrast(hex(text), hex(bg));
+            assert!((got - want).abs() < 1e-9, "{text} on {bg}: {got} != {want}");
         }
         assert_eq!(apca_contrast(Rgb::new(9, 9, 9), Rgb::new(9, 9, 9)), 0.0);
     }
@@ -672,7 +676,7 @@ mod tests {
         assert!(mapped);
         // Not exact: the spec's algorithm accepts a clipped color within a
         // just-noticeable difference (ΔE_OK 0.02) of the in-gamut target,
-        // so L and h may drift by about that much — as in a browser.
+        // so L and h may drift by about that much, as in a browser.
         let got = rgb.to_oklch();
         assert!((got.l - want.l).abs() < 0.02, "{got:?}");
         assert!((got.h - want.h).abs() < 3.0, "{got:?}");
@@ -683,17 +687,19 @@ mod tests {
         assert!(!mapped);
     }
 
+    // --- Formatting ---
+
     #[test]
-    fn fmt_num_trims() {
-        assert_eq!(fmt_num(50.0, 1), "50");
-        assert_eq!(fmt_num(40.54, 1), "40.5");
-        assert_eq!(fmt_num(-0.01, 1), "0");
-        assert_eq!(fmt_num(0.2577, 3), "0.258");
-        assert_eq!(fmt_num(0.1, 5), "0.1");
+    fn format_number_trims() {
+        assert_eq!(format_number(50.0, 1), "50");
+        assert_eq!(format_number(40.54, 1), "40.5");
+        assert_eq!(format_number(-0.01, 1), "0");
+        assert_eq!(format_number(0.2577, 3), "0.258");
+        assert_eq!(format_number(0.1, 5), "0.1");
     }
 
     /// Every `stride`-th value per channel. 255 is divisible by 1, 3, 5,
-    /// 15…, so those strides always include both ends of each channel —
+    /// 15…, so those strides always include both ends of each channel,
     /// where the gamut edges, and most rounding trouble, are.
     fn for_colors(stride: usize, mut f: impl FnMut(Rgb)) {
         assert_eq!(255 % stride, 0, "stride must divide 255");

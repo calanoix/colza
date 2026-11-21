@@ -17,46 +17,47 @@ use crate::color::Rgb;
 
 /// Pixels sampled per side of the magnifier grid (odd, so there is a
 /// well-defined center cell under the cursor).
-const LOUPE_PX: usize = 9;
-/// On-screen size in points of the whole magnifier square.
+const LOUPE_GRID: usize = 9;
+/// On-screen size of the whole magnifier square, in points.
 const LOUPE_SIZE: f32 = 180.0;
-const CELL: f32 = LOUPE_SIZE / LOUPE_PX as f32;
+/// On-screen size of one sampled pixel, in points.
+const CELL_SIZE: f32 = LOUPE_SIZE / LOUPE_GRID as f32;
+/// Height of the hex readout band under the grid, in points.
 const HEX_BAND_HEIGHT: f32 = 28.0;
 /// Height of the "still image" caption drawn under the hex band when the
 /// source isn't live.
 const STILL_CAPTION_HEIGHT: f32 = 14.0;
+/// Distance from the cursor to the loupe's nearest corner, in points.
 const LOUPE_OFFSET: f32 = 20.0;
 /// Length of each crosshair arm, in points. Where the arms *start* isn't
 /// a constant: see [`crosshair_gap`].
-const CROSSHAIR_ARM: f32 = 8.0;
+const CROSSHAIR_ARM_LENGTH: f32 = 8.0;
 /// Width of the crosshair's black outline (the white core is 1pt).
-const CROSSHAIR_OUTLINE: f32 = 3.0;
+const CROSSHAIR_OUTLINE_WIDTH: f32 = 3.0;
 /// Margin around anything the overlay paints, for antialiasing.
 const AA_MARGIN: f32 = 1.0;
 /// How long an area this overlay painted stays masked out of incoming
 /// frames (see [`MagnifierState::accept_frame`]). It must outlast the
-/// capture pipeline's latency — compositor, PipeWire, our thread, the
-/// next repaint — which is typically 2–4 display frames. Generous on
+/// capture pipeline's latency (compositor, PipeWire, the capture thread,
+/// the next repaint), which is typically 2–4 display frames. Generous on
 /// purpose: erring long only means a spot the loupe just left shows
 /// slightly older screen content for a moment; erring short lets the
 /// overlay leak back into the loupe, which is the bug this prevents.
 const OVERLAY_MASK_TIME: Duration = Duration::from_millis(300);
 
 /// Everything the magnifier needs to sample colors from the captured
-/// screenshot and map window-space points to image pixels. This is the
-/// reusable core: both the standalone `MagnifierApp` (CLI `magnify`
-/// subcommand, own eframe event loop) and the embedding `app::App` (a
-/// "pick" mode inside the main window) hold one of these and call
-/// `draw`/`handle_input` directly from their own `ui()`.
+/// image and map window-space points to image pixels. `app::App` holds
+/// one while picking, and calls `handle_input`/`draw` from the magnifier
+/// viewport's own `ui()`.
 ///
 /// This type knows nothing about PipeWire: to drive a live view, the owner
 /// hands each newer image to [`Self::accept_frame`] between frames (from
-/// `Capture::take_frame()`). Sampling reads straight out of that
+/// `ScreenSource::take_frame()`). Sampling reads straight out of that
 /// `RgbImage` on the CPU.
 pub struct MagnifierState {
     /// The image being sampled. Replace it through [`Self::accept_frame`]
-    /// rather than by assignment, so our own overlay gets masked out.
-    pub screenshot: RgbImage,
+    /// rather than by assignment, so the overlay itself gets masked out.
+    pub image: RgbImage,
     /// Window-space areas this overlay painted recently, newest last, for
     /// [`Self::accept_frame`] to mask out of incoming frames.
     overlay_history: VecDeque<(Instant, egui::Rect)>,
@@ -65,17 +66,17 @@ pub struct MagnifierState {
     /// `ctx.input()` describes the main window instead.
     scale: Option<egui::Vec2>,
     pub cursor_pos: egui::Pos2,
-    /// Whether `screenshot` is being refreshed. `false` draws a small
-    /// caption under the loupe, since the degraded path differs in two
-    /// ways that would otherwise look like a bug: the image never updates,
-    /// and the mouse cursor is baked into it.
+    /// Whether `image` is being refreshed. `false` draws a small caption
+    /// under the loupe, since the degraded path differs in two ways that
+    /// would otherwise look like a bug: the image never updates, and the
+    /// mouse cursor is baked into it.
     pub live: bool,
 }
 
 impl MagnifierState {
-    pub fn new(screenshot: RgbImage) -> Self {
+    pub fn new(image: RgbImage) -> Self {
         Self {
-            screenshot,
+            image,
             cursor_pos: egui::Pos2::ZERO,
             live: true,
             overlay_history: VecDeque::new(),
@@ -83,22 +84,22 @@ impl MagnifierState {
         }
     }
 
-    /// Takes a newer captured frame, with our own overlay removed.
+    /// Takes a newer captured frame, with the overlay itself removed.
     ///
     /// The ScreenCast stream films the whole screen, and this overlay is a
     /// window on it: the loupe and the crosshair end up in the very frames
     /// they display. `CursorMode::Hidden` only excludes the *system*
     /// cursor, and no portal lets a client exclude its own window. Because
     /// a frame arrives a few display frames after it was captured, what
-    /// leaks in is the overlay at an *earlier* position — a stray
-    /// crosshair or loupe flickering inside the loupe as it moves.
+    /// leaks in is the overlay at an *earlier* position: a stray crosshair
+    /// or loupe flickering inside the loupe as it moves.
     ///
-    /// We do know exactly where we painted, though. Every area the
-    /// overlay covered within the last [`OVERLAY_MASK_TIME`] keeps its
-    /// pixels from the previous image (itself already cleaned this way)
-    /// instead of taking the new frame's; the rest of the screen updates
-    /// normally. The first frame is captured before the overlay is shown,
-    /// so the chain starts clean.
+    /// The overlay does know exactly where it painted, though. Every area
+    /// it covered within the last [`OVERLAY_MASK_TIME`] keeps its pixels
+    /// from the previous image (itself already cleaned this way) instead
+    /// of taking the new frame's; the rest of the screen updates normally.
+    /// The first frame is captured before the overlay is shown, so the
+    /// chain starts clean.
     ///
     /// The cost is that a masked area doesn't update while the overlay
     /// keeps covering it. That is why the crosshair is masked arm by arm
@@ -119,25 +120,25 @@ impl MagnifierState {
         // nothing to restore from; take the frame as is.
         let scale = self
             .scale
-            .filter(|_| frame.dimensions() == self.screenshot.dimensions());
+            .filter(|_| frame.dimensions() == self.image.dimensions());
         if let Some(scale) = scale {
             let (w, h) = frame.dimensions();
             let row_bytes = w as usize * 3;
-            let prev = self.screenshot.as_raw();
+            let previous = self.image.as_raw();
             let next: &mut [u8] = &mut frame;
-            for (_, r) in &self.overlay_history {
-                let x0 = ((r.min.x * scale.x).floor().max(0.0) as u32).min(w) as usize;
-                let x1 = ((r.max.x * scale.x).ceil().max(0.0) as u32).min(w) as usize;
-                let y0 = ((r.min.y * scale.y).floor().max(0.0) as u32).min(h) as usize;
-                let y1 = ((r.max.y * scale.y).ceil().max(0.0) as u32).min(h) as usize;
+            for (_, rect) in &self.overlay_history {
+                let x0 = ((rect.min.x * scale.x).floor().max(0.0) as u32).min(w) as usize;
+                let x1 = ((rect.max.x * scale.x).ceil().max(0.0) as u32).min(w) as usize;
+                let y0 = ((rect.min.y * scale.y).floor().max(0.0) as u32).min(h) as usize;
+                let y1 = ((rect.max.y * scale.y).ceil().max(0.0) as u32).min(h) as usize;
                 for y in y0..y1 {
                     let span = y * row_bytes + x0 * 3..y * row_bytes + x1 * 3;
-                    next[span.clone()].copy_from_slice(&prev[span]);
+                    next[span.clone()].copy_from_slice(&previous[span]);
                 }
             }
         }
 
-        self.screenshot = frame;
+        self.image = frame;
     }
 
     /// Records an area painted this frame, for [`Self::accept_frame`].
@@ -154,15 +155,15 @@ impl MagnifierState {
     }
 
     pub fn color_at(&self, image_pos: (u32, u32)) -> Rgb {
-        let x = image_pos.0.min(self.screenshot.width().saturating_sub(1));
-        let y = image_pos.1.min(self.screenshot.height().saturating_sub(1));
-        let px = self.screenshot.get_pixel(x, y);
+        let x = image_pos.0.min(self.image.width().saturating_sub(1));
+        let y = image_pos.1.min(self.image.height().saturating_sub(1));
+        let px = self.image.get_pixel(x, y);
         Rgb::new(px[0], px[1], px[2])
     }
 
     /// Maps a point in window/logical space to a pixel in the captured
-    /// screenshot, accounting for the screenshot possibly being a
-    /// different resolution than the logical window size (HiDPI).
+    /// image, accounting for the image possibly being a different
+    /// resolution than the logical window size (HiDPI).
     pub fn image_pos_for(&self, ctx: &egui::Context, logical: egui::Pos2) -> (u32, u32) {
         pixel_at(logical, self.current_scale(ctx))
     }
@@ -175,7 +176,7 @@ impl MagnifierState {
     /// another `ctx.input(...)` closure (see the note in `handle_input`).
     fn current_scale(&self, ctx: &egui::Context) -> egui::Vec2 {
         let screen_rect = ctx.input(|i| i.viewport_rect());
-        image_scale(self.screenshot.dimensions(), screen_rect.size())
+        image_scale(self.image.dimensions(), screen_rect.size())
     }
 
     /// Inverse of [`Self::image_pos_for`]: the window-space center of an
@@ -188,9 +189,8 @@ impl MagnifierState {
 
     /// Reads pointer/keyboard input for this frame: updates `cursor_pos`
     /// (including arrow-key nudging), and reports whether the user picked
-    /// (click/Enter) or cancelled (Esc) this frame. Does not draw anything
-    /// and does not close any window — the caller decides what
-    /// picked/cancelled means.
+    /// (click/Enter) or cancelled (Escape) this frame. Draws nothing and
+    /// closes no window: the caller decides what picked/cancelled means.
     pub fn handle_input(&mut self, ctx: &egui::Context) -> MagnifierInput {
         let mut clicked_or_entered = false;
         let mut cancelled = false;
@@ -246,12 +246,12 @@ impl MagnifierState {
         // Arrow keys move the picked pixel by exactly one *image* pixel,
         // then put the cursor at that pixel's center. Stepping one window
         // point instead (as this used to) moves 1.25 pixels at 125%
-        // display scaling — so after rounding, sometimes 1 pixel and
-        // sometimes 2 — and 2 pixels at 200%, skipping every other one.
+        // display scaling, so after rounding sometimes 1 pixel and
+        // sometimes 2, and 2 pixels at 200%, skipping every other one.
         if nudge != (0, 0) {
             let scale = self.current_scale(ctx);
             let (x, y) = pixel_at(self.cursor_pos, scale);
-            let (w, h) = self.screenshot.dimensions();
+            let (w, h) = self.image.dimensions();
             let step = |v: u32, d: i64, len: u32| (v as i64 + d).clamp(0, len.max(1) as i64 - 1) as u32;
             self.cursor_pos = pixel_center((step(x, nudge.0, w), step(y, nudge.1, h)), scale);
         }
@@ -269,10 +269,10 @@ impl MagnifierState {
     pub fn draw(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let painter = ui.painter();
         let screen_rect = ctx.input(|i| i.viewport_rect());
-        self.scale = Some(image_scale(self.screenshot.dimensions(), screen_rect.size()));
+        self.scale = Some(image_scale(self.image.dimensions(), screen_rect.size()));
 
         let cursor = self.cursor_pos;
-        let half = (LOUPE_PX / 2) as i64;
+        let half = (LOUPE_GRID / 2) as i64;
 
         // Flip the loupe to the opposite side of the cursor if it would
         // otherwise run off the screen.
@@ -307,8 +307,8 @@ impl MagnifierState {
             .expand(2.0),
         );
 
-        for row in 0..LOUPE_PX {
-            for col in 0..LOUPE_PX {
+        for row in 0..LOUPE_GRID {
+            for col in 0..LOUPE_GRID {
                 let dx = col as i64 - half;
                 let dy = row as i64 - half;
                 let sample_x = (center_image_pos.0 as i64 + dx).max(0) as u32;
@@ -317,10 +317,10 @@ impl MagnifierState {
 
                 let cell_rect = egui::Rect::from_min_size(
                     egui::pos2(
-                        loupe_origin.x + col as f32 * CELL,
-                        loupe_origin.y + row as f32 * CELL,
+                        loupe_origin.x + col as f32 * CELL_SIZE,
+                        loupe_origin.y + row as f32 * CELL_SIZE,
                     ),
-                    egui::vec2(CELL, CELL),
+                    egui::vec2(CELL_SIZE, CELL_SIZE),
                 );
                 painter.rect_filled(
                     cell_rect,
@@ -333,10 +333,10 @@ impl MagnifierState {
         // Highlight the exact center cell (the pixel that would be picked).
         let center_rect = egui::Rect::from_min_size(
             egui::pos2(
-                loupe_origin.x + (LOUPE_PX / 2) as f32 * CELL,
-                loupe_origin.y + (LOUPE_PX / 2) as f32 * CELL,
+                loupe_origin.x + (LOUPE_GRID / 2) as f32 * CELL_SIZE,
+                loupe_origin.y + (LOUPE_GRID / 2) as f32 * CELL_SIZE,
             ),
-            egui::vec2(CELL, CELL),
+            egui::vec2(CELL_SIZE, CELL_SIZE),
         );
         painter.rect_stroke(
             center_rect.expand(1.0),
@@ -405,28 +405,26 @@ impl MagnifierState {
             );
         }
     }
-}
 
-impl MagnifierState {
-    /// Our own crosshair, standing in for the system cursor (which the
-    /// owner hides while the magnifier is up — see `app.rs`). It follows
-    /// `cursor_pos`, so it moves with arrow-key nudges as well as the
-    /// mouse.
+    /// The magnifier's own crosshair, standing in for the system cursor
+    /// (which the owner hides while the magnifier is up, see `app.rs`). It
+    /// follows `cursor_pos`, so it moves with arrow-key nudges as well as
+    /// the mouse.
     ///
     /// Four arms around an empty center, so the pixel being picked stays
     /// visible, each drawn white over a wider black stroke so it reads on
     /// any background.
     fn draw_crosshair(&mut self, ctx: &egui::Context, painter: &egui::Painter, image_pos: (u32, u32)) {
-        let c = self.logical_center_of(ctx, image_pos);
+        let center = self.logical_center_of(ctx, image_pos);
         let gap = crosshair_gap(self.scale.unwrap_or(egui::Vec2::splat(1.0)));
-        for (a, b) in crosshair_arms(c, gap) {
+        for (a, b) in crosshair_arms(center, gap) {
             self.record_overlay(crosshair_arm_footprint(a, b));
         }
         for (width, color) in [
-            (CROSSHAIR_OUTLINE, egui::Color32::BLACK),
+            (CROSSHAIR_OUTLINE_WIDTH, egui::Color32::BLACK),
             (1.0, egui::Color32::WHITE),
         ] {
-            for (a, b) in crosshair_arms(c, gap) {
+            for (a, b) in crosshair_arms(center, gap) {
                 painter.line_segment([a, b], egui::Stroke::new(width, color));
             }
         }
@@ -434,28 +432,28 @@ impl MagnifierState {
 }
 
 /// Distance from the crosshair's center to where its arms start, in
-/// points: just far enough that nothing the crosshair paints — outline
-/// and antialiasing included — lands on a pixel the loupe samples.
+/// points: just far enough that nothing the crosshair paints (outline and
+/// antialiasing included) lands on a pixel the loupe samples.
 ///
-/// That's what keeps the whole 9×9 grid live. The ScreenCast stream
-/// films our own overlay, so pixels under the crosshair can't be shown
-/// as they really are; [`MagnifierState::accept_frame`] substitutes the
-/// last clean value for them, which freezes them. With the arms inside
-/// the grid, those frozen cells stood still in the middle of a playing
-/// video. Starting the arms outside it means there is nothing to freeze
-/// while the crosshair holds still. (Moving, it still masks the spots it
-/// just left for a moment, which the motion hides.)
+/// That's what keeps the whole 9×9 grid live. The ScreenCast stream films
+/// the overlay itself, so pixels under the crosshair can't be shown as
+/// they really are; [`MagnifierState::accept_frame`] substitutes the last
+/// clean value for them, which freezes them. With the arms inside the
+/// grid, those frozen cells stood still in the middle of a playing video.
+/// Starting the arms outside it means there is nothing to freeze while
+/// the crosshair holds still. (Moving, it still masks the spots it just
+/// left for a moment, which the motion hides.)
 ///
 /// Depends on the HiDPI scale, since the grid's extent is fixed in image
-/// pixels: the outermost sampled pixel reaches `LOUPE_PX / 2 + 0.5` pixels
-/// from the center one's center. The smaller of the two axis scales gives
-/// the larger, safe distance.
+/// pixels: the outermost sampled pixel reaches `LOUPE_GRID / 2 + 0.5`
+/// pixels from the center one's center. The smaller of the two axis
+/// scales gives the larger, safe distance.
 fn crosshair_gap(scale: egui::Vec2) -> f32 {
     let scale = scale.x.min(scale.y).max(f32::EPSILON);
-    let grid_reach = ((LOUPE_PX / 2) as f32 + 0.5) / scale;
+    let grid_reach = ((LOUPE_GRID / 2) as f32 + 0.5) / scale;
     // Half a pixel more than strictly needed, so a stroke landing exactly
     // on a pixel boundary can't bleed into the outermost cell.
-    grid_reach + 0.5 / scale + CROSSHAIR_OUTLINE / 2.0 + AA_MARGIN
+    grid_reach + 0.5 / scale + CROSSHAIR_OUTLINE_WIDTH / 2.0 + AA_MARGIN
 }
 
 /// The four arms as segments, outward from the gap around `center`.
@@ -466,17 +464,14 @@ fn crosshair_arms(center: egui::Pos2, gap: f32) -> [(egui::Pos2, egui::Pos2); 4]
         egui::vec2(0.0, 1.0),
         egui::vec2(0.0, -1.0),
     ]
-    .map(|dir| (center + dir * gap, center + dir * (gap + CROSSHAIR_ARM)))
+    .map(|dir| (center + dir * gap, center + dir * (gap + CROSSHAIR_ARM_LENGTH)))
 }
 
 /// Everything an arm from `a` to `b` can paint: the segment widened by
 /// the outline and antialiasing. (Butt caps: nothing goes past `a`/`b`
 /// along the arm but the antialiasing.)
 fn crosshair_arm_footprint(a: egui::Pos2, b: egui::Pos2) -> egui::Rect {
-    egui::Rect::from_two_pos(a, b).expand(CROSSHAIR_OUTLINE / 2.0 + AA_MARGIN)
-}
-
-impl MagnifierState {
+    egui::Rect::from_two_pos(a, b).expand(CROSSHAIR_OUTLINE_WIDTH / 2.0 + AA_MARGIN)
 }
 
 /// Image pixels per window point, per axis: how much bigger the captured
@@ -509,11 +504,12 @@ fn pixel_center((x, y): (u32, u32), scale: egui::Vec2) -> egui::Pos2 {
 }
 
 /// Result of `MagnifierState::handle_input` for one frame: at most one of
-/// these is set (a click/Enter picks, Esc cancels).
+/// these is set (a click/Enter picks, Escape cancels).
 pub struct MagnifierInput {
     pub picked: Option<Rgb>,
     pub cancelled: bool,
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,7 +527,7 @@ mod tests {
         state.record_overlay(egui::Rect::from_min_max(egui::pos2(5.0, 5.0), egui::pos2(10.0, 10.0)));
 
         state.accept_frame(solid(200));
-        let at = |s: &MagnifierState, x, y| s.screenshot.get_pixel(x, y)[0];
+        let at = |s: &MagnifierState, x, y| s.image.get_pixel(x, y)[0];
         assert_eq!(at(&state, 10, 10), 10, "inside the mask (points 5..10 = px 10..20)");
         assert_eq!(at(&state, 19, 19), 10);
         assert_eq!(at(&state, 20, 20), 200, "just outside");
@@ -544,12 +540,12 @@ mod tests {
     }
 
     /// The crosshair never paints onto a pixel the loupe samples, at any
-    /// HiDPI scale — so none of the grid gets frozen by the mask.
+    /// HiDPI scale, so none of the grid gets frozen by the mask.
     #[test]
     fn crosshair_stays_off_the_sampled_grid() {
         for scale in [1.0, 1.25, 1.5, 2.0, 3.0] {
             let center = egui::pos2(500.5 / scale, 300.5 / scale); // a pixel center
-            let half = (LOUPE_PX / 2) as f32;
+            let half = (LOUPE_GRID / 2) as f32;
             // The sampled grid, in points: pixel edges, not centers.
             let grid = egui::Rect::from_center_size(
                 center,
@@ -557,11 +553,11 @@ mod tests {
             );
             let gap = crosshair_gap(egui::Vec2::splat(scale));
             for (a, b) in crosshair_arms(center, gap) {
-                let foot = crosshair_arm_footprint(a, b);
-                let overlap = foot.intersect(grid);
+                let footprint = crosshair_arm_footprint(a, b);
+                let overlap = footprint.intersect(grid);
                 assert!(
                     overlap.width() <= 0.0 || overlap.height() <= 0.0,
-                    "scale {scale}: arm {foot:?} overlaps grid {grid:?}"
+                    "scale {scale}: arm {footprint:?} overlaps grid {grid:?}"
                 );
             }
         }
@@ -569,7 +565,7 @@ mod tests {
 
     /// At any display scale, `pixel_at` of a pixel's center is that
     /// pixel, so one arrow press (pixel +1, then its center) moves exactly
-    /// one pixel — the bug was 1 or 2 at 125%.
+    /// one pixel. The bug was 1 or 2 at 125%.
     #[test]
     fn pixel_center_roundtrips_at_fractional_scales() {
         for s in [1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 3.0] {
@@ -591,9 +587,9 @@ mod tests {
     #[test]
     fn holding_still_does_not_grow_the_history() {
         let mut state = MagnifierState::new(solid(0));
-        let r = egui::Rect::from_min_size(egui::pos2(1.0, 1.0), egui::vec2(3.0, 3.0));
+        let rect = egui::Rect::from_min_size(egui::pos2(1.0, 1.0), egui::vec2(3.0, 3.0));
         for _ in 0..100 {
-            state.record_overlay(r);
+            state.record_overlay(rect);
         }
         assert_eq!(state.overlay_history.len(), 1);
     }
@@ -604,6 +600,6 @@ mod tests {
         state.scale = Some(egui::vec2(1.0, 1.0));
         state.record_overlay(egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(10.0, 10.0)));
         state.accept_frame(RgbImage::from_pixel(60, 40, image::Rgb([99, 99, 99])));
-        assert_eq!(state.screenshot.get_pixel(5, 5)[0], 99);
+        assert_eq!(state.image.get_pixel(5, 5)[0], 99);
     }
 }

@@ -1,16 +1,16 @@
 //! Screen capture via `org.freedesktop.portal.ScreenCast` + PipeWire.
 //!
 //! `ScreenCast`'s `SelectSourcesOptions` supports `CursorMode::Hidden`,
-//! which omits the mouse cursor from the video frames entirely — unlike
+//! which omits the mouse cursor from the video frames entirely, unlike
 //! `Screenshot` (`portal.rs`), which always bakes the cursor into the
 //! image. The cost is that `ScreenCast` hands back a raw PipeWire node id
-//! + fd instead of a finished image, so this module has to speak PipeWire
-//! to pull frames out of it.
+//! and fd instead of a finished image, so this module has to speak
+//! PipeWire to pull frames out of it.
 //!
 //! [`Capture`] keeps the session and the PipeWire stream alive and
 //! continuously overwrites a single "latest frame" slot for as long as the
 //! handle is held, so the magnifier gets a live feed rather than a frozen
-//! snapshot — the loupe tracks a playing video, for example. The UI calls
+//! snapshot: the loupe tracks a playing video, for example. The UI calls
 //! [`Capture::take_frame`] once per repaint and swaps in whatever arrived;
 //! dropping the handle stops the stream and closes the portal session.
 //!
@@ -24,6 +24,14 @@
 //! `select_sources` is handed a saved restore token (`token_store.rs`)
 //! with `PersistMode::ExplicitlyRevoked`, so the compositor restores the
 //! previous screen selection silently instead of prompting on every run.
+//!
+//! Resetting the grant: it lives in the compositor's own privacy settings
+//! (GNOME: Settings → Privacy → Screen Sharing), plus `token_store.rs`'s
+//! file ("Forget shared screen" on the settings page). Revoking on the
+//! compositor side while the token file remains just means the next
+//! `select_sources` sends a stale token, which the portal ignores in favor
+//! of prompting, and the new token then gets saved. No cleanup is needed
+//! on colza's side.
 
 use crate::token_store;
 use ashpd::desktop::{
@@ -38,7 +46,7 @@ use std::sync::{Arc, Mutex};
 ///
 /// This is the main cost knob for the live feed: every frame is converted
 /// from the compositor's layout (usually BGRx) into a packed `RgbImage` on
-/// the CPU, so the work scales with `framerate * screen area`. 30 keeps
+/// the CPU, so the work scales with `FRAMERATE * screen area`. 30 keeps
 /// the loupe feeling immediate on a video; lower it if a large display
 /// makes the capture thread too hot.
 ///
@@ -54,8 +62,8 @@ const FRAMERATE: u32 = 30;
 /// dialog, on runs that show one) is already done, and a compositor sends
 /// the current screen contents as soon as the stream connects. Several
 /// seconds is generous for the happy path; the timeout exists for the
-/// paths that would otherwise hang forever — see
-/// [`Capture::no_frame_error`] for what those are.
+/// paths that would otherwise hang forever (see
+/// [`Capture::no_frame_error`] for what those are).
 const FIRST_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Counters the PipeWire thread bumps as it goes, read only when something
@@ -72,9 +80,9 @@ struct StreamDiagnostics {
     format_negotiated: AtomicBool,
     /// Buffers successfully dequeued from the stream.
     buffers_dequeued: AtomicU32,
-    /// Buffers whose plane had no CPU-readable data — the DMA-BUF
-    /// signature: the compositor handed over GPU memory, which this
-    /// module deliberately does not import.
+    /// Buffers whose plane had no CPU-readable data. That's the DMA-BUF
+    /// signature: the compositor handed over GPU memory, which this module
+    /// deliberately does not import.
     planes_unmapped: AtomicU32,
     /// Buffers that made it all the way to an `RgbImage`.
     frames_decoded: AtomicU32,
@@ -94,7 +102,7 @@ static SCREENCAST_DECLINED: AtomicBool = AtomicBool::new(false);
 /// Clears a "no" given earlier in this run, so the next pick asks for
 /// screen sharing again. Called when the user picks live capture on the
 /// settings page: choosing it there is a clear sign they now want it.
-pub fn forget_refusal() {
+pub fn forget_declined() {
     SCREENCAST_DECLINED.store(false, Ordering::Relaxed);
 }
 
@@ -137,9 +145,9 @@ impl ScreenSource {
 /// declines the screen-share prompt.
 ///
 /// Order of attempts:
-/// 1. `ScreenCast` — live feed, cursor hidden. Skipped outright if the
+/// 1. `ScreenCast`: live feed, cursor hidden. Skipped outright if the
 ///    user already declined once this run.
-/// 2. `Screenshot` — a still frame, cursor included.
+/// 2. `Screenshot`: a still frame, cursor included.
 ///
 /// Only an explicit refusal triggers the fallback; every other failure
 /// propagates. Silently degrading on a technical error would throw away
@@ -149,11 +157,11 @@ impl ScreenSource {
 pub async fn open_best() -> anyhow::Result<(ScreenSource, RgbImage)> {
     if !SCREENCAST_DECLINED.load(Ordering::Relaxed) {
         match Capture::open().await {
-            Ok((capture, first)) => return Ok((ScreenSource::Live(capture), first)),
-            Err(err) if is_user_refusal(&err) => {
+            Ok((capture, first_frame)) => return Ok((ScreenSource::Live(capture), first_frame)),
+            Err(err) if is_declined(&err) => {
                 SCREENCAST_DECLINED.store(true, Ordering::Relaxed);
                 eprintln!(
-                    "colza: screen sharing declined — falling back to a still screenshot. \
+                    "colza: screen sharing declined, falling back to a still screenshot. \
                      The magnifier will not track changes on screen, and the mouse cursor \
                      will appear in the captured image. Restart colza to be asked again."
                 );
@@ -162,8 +170,8 @@ pub async fn open_best() -> anyhow::Result<(ScreenSource, RgbImage)> {
         }
     }
 
-    let still = crate::portal::capture_screen().await?;
-    Ok((ScreenSource::Still, still))
+    let image = crate::portal::capture_screen().await?;
+    Ok((ScreenSource::Still, image))
 }
 
 /// Whether this error is the user saying no, as opposed to something
@@ -174,7 +182,7 @@ pub async fn open_best() -> anyhow::Result<(ScreenSource, RgbImage)> {
 /// `Error::Response(ResponseError::Cancelled)`. This also matches the user
 /// dismissing the dialog with Escape rather than clicking a "deny" button;
 /// the portal makes no distinction, and neither does this function.
-fn is_user_refusal(err: &anyhow::Error) -> bool {
+fn is_declined(err: &anyhow::Error) -> bool {
     matches!(
         err.downcast_ref::<ashpd::Error>(),
         Some(ashpd::Error::Response(
@@ -196,9 +204,9 @@ pub struct Capture {
     /// than `std::sync::mpsc` because the receiving thread is blocked
     /// inside `mainloop.run()` and can only be woken through the loop
     /// itself.
-    stop: pipewire::channel::Sender<()>,
+    stop_tx: pipewire::channel::Sender<()>,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// Kept alive purely so the compositor keeps feeding the stream —
+    /// Kept alive purely so the compositor keeps feeding the stream:
     /// closing the session tears the PipeWire node down. `Option` only so
     /// `Drop` can move it out.
     session: Option<Session<Screencast>>,
@@ -214,7 +222,7 @@ impl Capture {
     /// than flashing an empty overlay while negotiation finishes.
     ///
     /// Must be awaited on `runtime::shared()`: ashpd's cached D-Bus
-    /// connection binds to the first runtime it sees (see runtime.rs).
+    /// connection binds to the first runtime it sees (see `runtime.rs`).
     pub async fn open() -> anyhow::Result<(Self, RgbImage)> {
         let proxy: Screencast = Screencast::new().await?;
         let session = proxy.create_session(Default::default()).await?;
@@ -240,7 +248,7 @@ impl Capture {
             .response()?;
 
         // `None` here means the dialog, on runs where it appears, isn't
-        // parented to our window — exporting a real handle would need
+        // parented to colza's window: exporting a real handle would need
         // ashpd's wayland/gtk4 features and access to eframe's surface.
         let response = proxy
             .start(&session, None, Default::default())
@@ -266,7 +274,7 @@ impl Capture {
 
         let latest: Arc<Mutex<Option<RgbImage>>> = Arc::new(Mutex::new(None));
         let diagnostics: Arc<StreamDiagnostics> = Arc::default();
-        let (stop, stop_rx) = pipewire::channel::channel::<()>();
+        let (stop_tx, stop_rx) = pipewire::channel::channel::<()>();
         // Signals "the first frame is in the slot" or "setup failed". A
         // oneshot rather than an mpsc because `oneshot::Sender::send` is
         // non-blocking and needs no runtime, so the plain OS thread below
@@ -290,7 +298,7 @@ impl Capture {
                         std::rc::Rc::clone(&ready),
                     ) {
                         match ready.borrow_mut().take() {
-                            // Failed before the first frame — report it to
+                            // Failed before the first frame: report it to
                             // `open()`, which is still waiting.
                             Some(tx) => {
                                 let _ = tx.send(Err(err));
@@ -311,7 +319,7 @@ impl Capture {
         // and closes the portal session.
         let capture = Self {
             latest,
-            stop,
+            stop_tx,
             thread: Some(thread),
             session: Some(session),
             diagnostics,
@@ -326,29 +334,29 @@ impl Capture {
                 anyhow::bail!("the screencast thread stopped before producing a frame")
             }
             // The stream is alive and reported no error, but no frame ever
-            // landed — without this timeout the await would simply never
+            // landed; without this timeout the await would simply never
             // return.
             Err(_elapsed) => return Err(capture.no_frame_error()),
         }
 
-        let first = capture
+        let first_frame = capture
             .take_frame()
             .ok_or_else(|| anyhow::anyhow!("screencast signalled a frame but the slot was empty"))?;
 
-        Ok((capture, first))
+        Ok((capture, first_frame))
     }
 
     /// Builds the error for "waited [`FIRST_FRAME_TIMEOUT`] and got no
     /// frame", naming the most likely cause from what the stream thread
-    /// observed — worth doing because the causes are genuinely different
+    /// observed. Worth doing because the causes are genuinely different
     /// problems (a limitation of this code, the screen being off, a broken
     /// connection) that are otherwise indistinguishable from the outside.
     fn no_frame_error(&self) -> anyhow::Error {
-        let d = &self.diagnostics;
-        let dequeued = d.buffers_dequeued.load(Ordering::Relaxed);
-        let unmapped = d.planes_unmapped.load(Ordering::Relaxed);
-        let decoded = d.frames_decoded.load(Ordering::Relaxed);
-        let negotiated = d.format_negotiated.load(Ordering::Relaxed);
+        let diagnostics = &self.diagnostics;
+        let dequeued = diagnostics.buffers_dequeued.load(Ordering::Relaxed);
+        let unmapped = diagnostics.planes_unmapped.load(Ordering::Relaxed);
+        let decoded = diagnostics.frames_decoded.load(Ordering::Relaxed);
+        let negotiated = diagnostics.format_negotiated.load(Ordering::Relaxed);
         let secs = FIRST_FRAME_TIMEOUT.as_secs();
 
         if unmapped > 0 {
@@ -356,7 +364,7 @@ impl Capture {
                 "no readable frame after {secs}s: the compositor delivered {unmapped} buffer(s) \
                  with no CPU-mappable data, which means DMA-BUF (GPU memory). colza only reads \
                  shared-memory buffers, so this compositor/driver combination isn't supported \
-                 yet — importing DMA-BUF would need an EGL path"
+                 yet; importing DMA-BUF would need an EGL path"
             )
         } else if dequeued == 0 && !negotiated {
             anyhow::anyhow!(
@@ -380,14 +388,14 @@ impl Capture {
 
     /// Takes the newest frame, if one has arrived since the last call.
     ///
-    /// `None` means nothing new — the caller should keep displaying what
-    /// it already has, which is why this is cheap to call every repaint.
-    /// The image is moved out of the slot rather than copied, so this
-    /// costs a mutex lock and a pointer move regardless of resolution.
+    /// `None` means nothing new: the caller should keep displaying what it
+    /// already has, which is why this is cheap to call every repaint. The
+    /// image is moved out of the slot rather than copied, so this costs a
+    /// mutex lock and a pointer move regardless of resolution.
     pub fn take_frame(&self) -> Option<RgbImage> {
         self.latest
             .lock()
-            .expect("frame slot mutex poisoned by the pipewire thread")
+            .expect("frame slot mutex poisoned by the PipeWire thread")
             .take()
     }
 }
@@ -395,23 +403,23 @@ impl Capture {
 impl Drop for Capture {
     fn drop(&mut self) {
         // Wakes the mainloop out of `run()` so the thread can unwind. An
-        // error here means the receiver is already gone (thread died on
-        // its own), in which case the join below returns immediately.
-        let _ = self.stop.send(());
+        // error here means the receiver is already gone (the thread died
+        // on its own), in which case the join below returns immediately.
+        let _ = self.stop_tx.send(());
 
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
 
         // ashpd's `Session` has no `Drop` of its own, so an unclosed
-        // session lingers server-side until the process exits — survivable
-        // for the CLI but not for the GUI, which opens a session per pick.
+        // session lingers server-side until the process exits, and the
+        // GUI opens a new session on every pick.
         //
         // Spawned rather than `block_on`: `Drop` runs on the UI thread and
         // must not park it on a D-Bus round-trip, and `block_on` from
         // inside an async context would deadlock outright. The task
-        // outliving the process is fine — the portal drops sessions with
-        // the client connection anyway; this is just the tidy path.
+        // outliving the process is fine (the portal drops sessions with
+        // the client connection anyway); this is just the tidy path.
         if let Some(session) = self.session.take() {
             if let Ok(rt) = crate::runtime::shared() {
                 rt.spawn(async move {
@@ -426,17 +434,17 @@ impl Drop for Capture {
 /// [`Capture::open`].
 ///
 /// `Rc<RefCell<Option<..>>>` because either of two places on the PipeWire
-/// thread can fire it — the `process` callback on the first frame, or the
-/// error path if setup never gets that far — and whichever arrives first
+/// thread can fire it (the `process` callback on the first frame, or the
+/// error path if setup never gets that far), and whichever arrives first
 /// takes the sender. `Rc` rather than `Arc` since both live on that one
 /// thread.
 type ReadySignal =
     std::rc::Rc<std::cell::RefCell<Option<tokio::sync::oneshot::Sender<anyhow::Result<()>>>>>;
 
 /// Drives an entire PipeWire mainloop on the calling (dedicated) thread:
-/// connects to the fd the portal handed us, negotiates a raw video format
-/// on the given node, and pushes every decoded frame into `latest` until
-/// `stop_rx` fires. Blocking, by design.
+/// connects to the fd the portal handed over, negotiates a raw video
+/// format on the given node, and pushes every decoded frame into `latest`
+/// until `stop_rx` fires. Blocking, by design.
 fn run_stream(
     pw_fd: std::os::fd::OwnedFd,
     node_id: u32,
@@ -500,11 +508,11 @@ fn run_stream(
 
     let format_for_process = Rc::clone(&format);
     let format_for_param_changed = Rc::clone(&format);
-    let diag_for_process = Arc::clone(&diagnostics);
-    let diag_for_param_changed = Arc::clone(&diagnostics);
+    let diagnostics_for_process = Arc::clone(&diagnostics);
+    let diagnostics_for_param_changed = Arc::clone(&diagnostics);
 
     // `::<()>` because this listener carries no PipeWire-managed user
-    // data — the state the callbacks need is captured by the closures
+    // data: the state the callbacks need is captured by the closures
     // instead. Without the turbofish, `D` is unconstrained since neither
     // closure reads its user-data argument.
     let _listener = stream
@@ -521,7 +529,7 @@ fn run_stream(
                 return;
             }
             match format_for_param_changed.borrow_mut().parse(param) {
-                Ok(_) => diag_for_param_changed
+                Ok(_) => diagnostics_for_param_changed
                     .format_negotiated
                     .store(true, Ordering::Relaxed),
                 Err(err) => eprintln!("colza: failed to parse negotiated video format: {err}"),
@@ -531,7 +539,7 @@ fn run_stream(
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
-            diag_for_process
+            diagnostics_for_process
                 .buffers_dequeued
                 .fetch_add(1, Ordering::Relaxed);
 
@@ -555,7 +563,7 @@ fn run_stream(
             // "unsupported" instead of "try again", and `no_frame_error`
             // reports it as such.
             let Some(chunk_data) = plane.data() else {
-                diag_for_process
+                diagnostics_for_process
                     .planes_unmapped
                     .fetch_add(1, Ordering::Relaxed);
                 return;
@@ -564,17 +572,18 @@ fn run_stream(
             let info = format_for_process.borrow();
             let (width, height) = (info.size().width, info.size().height);
             if width == 0 || height == 0 {
-                // Format not negotiated yet — shouldn't happen, since
+                // Format not negotiated yet. Shouldn't happen, since
                 // `param_changed` fires before the first `process`, but
                 // bail rather than build a zero-sized image if it ever
                 // does.
                 return;
             }
 
-            let Some(img) = frame_to_rgb(chunk_data, width, height, stride, info.format()) else {
+            let Some(image) = frame_to_rgb(chunk_data, width, height, stride, info.format())
+            else {
                 return;
             };
-            diag_for_process
+            diagnostics_for_process
                 .frames_decoded
                 .fetch_add(1, Ordering::Relaxed);
 
@@ -584,10 +593,10 @@ fn run_stream(
             // images.
             *latest
                 .lock()
-                .expect("frame slot mutex poisoned by the ui thread") = Some(img);
+                .expect("frame slot mutex poisoned by the UI thread") = Some(image);
 
-            // First frame: unblock `open()`. Subsequent frames find `None`
-            // here and skip.
+            // First frame: unblock `open()`. Later frames find `None` here
+            // and skip.
             if let Some(tx) = ready.borrow_mut().take() {
                 let _ = tx.send(Ok(()));
             }
@@ -595,10 +604,10 @@ fn run_stream(
         .register()?;
 
     // Only formats with a trivial byte-order mapping to `image::Rgb` are
-    // offered — no YUY2/I420, since a YUV->RGB path would be untestable
-    // guesswork here and this app only ever reads pixel colors back out.
+    // offered, no YUY2/I420: a YUV → RGB path would be untestable
+    // guesswork here, and this app only ever reads pixel colors back out.
     // GNOME/mutter normally picks BGRx from this list.
-    let obj = spa::pod::object!(
+    let format_object = spa::pod::object!(
         SpaTypes::ObjectParamFormat,
         ParamType::EnumFormat,
         spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
@@ -634,13 +643,15 @@ fn run_stream(
             Fraction { num: 1000, denom: 1 }
         ),
     );
-    let values: Vec<u8> =
-        PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
-            .map_err(|err| anyhow::anyhow!("failed to serialize pipewire format pod: {err:?}"))?
-            .0
-            .into_inner();
-    let mut params = [Pod::from_bytes(&values)
-        .ok_or_else(|| anyhow::anyhow!("failed to build pipewire format Pod from bytes"))?];
+    let pod_bytes: Vec<u8> = PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &Value::Object(format_object),
+    )
+    .map_err(|err| anyhow::anyhow!("failed to serialize the PipeWire format pod: {err:?}"))?
+    .0
+    .into_inner();
+    let mut params = [Pod::from_bytes(&pod_bytes)
+        .ok_or_else(|| anyhow::anyhow!("failed to build the PipeWire format pod from bytes"))?];
 
     stream.connect(
         Direction::Input,
@@ -650,7 +661,7 @@ fn run_stream(
     )?;
 
     // Attached after `connect` but before `run`, and kept in scope for the
-    // whole loop — dropping an `AttachedReceiver` detaches it, which would
+    // whole loop: dropping an `AttachedReceiver` detaches it, which would
     // make the stop signal a no-op and hang this thread forever.
     //
     // A weak handle in the callback, because the callback is owned by an
@@ -675,8 +686,8 @@ fn run_stream(
 ///
 /// Builds the backing `Vec` directly and hands it to `from_raw` in one
 /// pass over the source, rather than a `put_pixel` loop that would pay a
-/// bounds check and function call per pixel — invisible for a single
-/// snapshot but not for a 30fps full-screen feed.
+/// bounds check and function call per pixel: invisible for a single
+/// snapshot, but not for a 30 fps full-screen feed.
 ///
 /// Returns `None` for an unsupported format or a short/truncated buffer,
 /// which the caller treats as "skip this frame".
@@ -692,8 +703,8 @@ fn frame_to_rgb(
     let (w, h) = (width as usize, height as usize);
     let mut out = Vec::with_capacity(w * h * 3);
 
-    // `row` is clipped to the visible width so trailing stride padding is
-    // never copied into the image.
+    // Each row is clipped to the visible width, so trailing stride padding
+    // is never copied into the image.
     for y in 0..h {
         let start = y * stride;
         match format {
@@ -710,7 +721,7 @@ fn frame_to_rgb(
             }
             other => {
                 eprintln!(
-                    "colza: negotiated an unsupported pipewire video format ({other:?}); \
+                    "colza: negotiated an unsupported PipeWire video format ({other:?}); \
                      this shouldn't happen since only RGB/RGBx/RGBA/BGRx/BGRA were offered"
                 );
                 return None;
@@ -720,10 +731,3 @@ fn frame_to_rgb(
 
     RgbImage::from_raw(width, height, out)
 }
-
-// If the user wants to reset the ScreenCast grant, it lives in the
-// compositor's own privacy settings (GNOME: Settings -> Privacy -> Screen
-// Sharing), plus `token_store.rs`'s file. Revoking on the compositor side
-// while our token file remains just means the next `select_sources` sends
-// a stale token, which the portal ignores in favor of prompting — and then
-// the new token gets saved. No cleanup needed on our side.

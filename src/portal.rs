@@ -1,10 +1,12 @@
-//! - [`capture_screen`] (`Screenshot`), the fallback capture path used when
-//!   the user declines the ScreenCast permission (see
-//!   `screencast::open_best`): a full-screen PNG we decode and zoom into
-//!   ourselves.
+//! Still screen capture via `org.freedesktop.portal.Screenshot`.
 //!
-//! `Screenshot` has no `cursor_mode` knob, so its image always has the
-//! system cursor baked in and never updates — `screencast.rs`'s
+//! [`capture_screen`] is the fallback capture path, used when the user
+//! declines the ScreenCast permission (see `screencast::open_best`) or
+//! chooses "Still image" on the settings page: a full-screen PNG that
+//! colza decodes and zooms into itself.
+//!
+//! `Screenshot` has no `cursor_mode` option, so its image always has the
+//! system cursor baked in and never updates. `screencast.rs`'s
 //! PipeWire-based capture is used instead whenever the user grants it.
 
 use image::RgbImage;
@@ -29,20 +31,20 @@ pub async fn capture_screen() -> anyhow::Result<RgbImage> {
     let uri = response.uri();
     // ashpd 0.13's `Uri` is a lightweight string wrapper with no file-path
     // conversion of its own (it replaced the old `url::Url`-backed type),
-    // so `url` — already a dependency — does the `file://` -> path parsing.
+    // so `url`, already a dependency, does the `file://` → path parsing.
     let parsed = url::Url::parse(uri.as_str())
         .map_err(|err| anyhow::anyhow!("portal returned an unparseable URI '{uri}': {err}"))?;
     let path = parsed
         .to_file_path()
         .map_err(|_| anyhow::anyhow!("portal returned a non-local URI: {uri}"))?;
 
-    let img = image::open(&path)
+    let image = image::open(&path)
         .map_err(|err| anyhow::anyhow!("failed to decode screenshot at {path:?}: {err}"))?
         .to_rgb8();
 
-    // Best-effort cleanup; the portal writes into a per-session temp/cache
+    // Best-effort cleanup: the portal writes into a per-session temp/cache
     // dir, so a failure here isn't fatal to the caller.
     let _ = std::fs::remove_file(&path);
 
-    Ok(img)
+    Ok(image)
 }

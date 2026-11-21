@@ -9,8 +9,8 @@
 //!     pass/fail tags;
 //!   - right (grey): Foreground and Background "cards", each as tall as
 //!     its content (format dropdown, swatch, text field, eyedropper,
-//!     three sliders for the chosen format's model — R/G/B, H/S/L or
-//!     OkLCh's L/C/H — plus Alpha, with gradient rails and value
+//!     three sliders for the chosen format's model, R/G/B, H/S/L or
+//!     OkLCh's L/C/H, plus Alpha, with gradient rails and value
 //!     readouts).
 //!
 //! The settings button swaps the body for a settings page (theme, screen
@@ -29,15 +29,16 @@
 //!
 //! Fonts: Roboto Regular and Roboto Bold are embedded from `assets/`.
 //!
-//! Run with: `cargo run -- gui`
+//! Run with: `cargo run`
 
 use std::sync::Arc;
 
 use eframe::egui;
 use image::RgbImage;
 
-use crate::color::{fmt_num, Hsl, Oklch, Rgb};
+use crate::color::{format_number, Hsl, Oklch, Rgb};
 use crate::magnifier::MagnifierState;
+use crate::prefs::CaptureMethod;
 use crate::screencast::ScreenSource;
 
 /// Colors shared with flax's `panel.css` (`:root` for light,
@@ -116,21 +117,22 @@ const FAIL_BG: egui::Color32 = egui::Color32::from_rgb(0xD9, 0x30, 0x25);
 const ICON_HOVER: egui::Color32 = egui::Color32::from_rgba_premultiplied(19, 19, 19, 38);
 
 /// Horizontal gap between the layout columns.
-const COL_GAP: f32 = 12.0;
+const COLUMN_GAP: f32 = 12.0;
 /// Height of the header toolbar. flax uses 36px, but the logo needs more
 /// air around it than the plain-text title had.
 const HEADER_HEIGHT: f32 = 44.0;
 /// Height of swatch, text field and icon buttons.
 const CONTROL_SIZE: f32 = 32.0;
-/// Card inner margin (flax: 16px) and border width.
+/// Inner margin of cards and of the summary section (flax: 16px).
 const CARD_MARGIN: f32 = 16.0;
-/// Width of the left "contrast" section, including its right border
-/// (flax: the sidebar, separated from the detail pane by a 1px line).
-const LEFT_WIDTH: f32 = 260.0;
+/// Width of the left "contrast" summary section, including its right
+/// border (flax: the sidebar, separated from the detail pane by a 1px
+/// line).
+const SUMMARY_WIDTH: f32 = 260.0;
 /// Fixed window size (the window is not resizable). The height fits the
 /// tallest section: header (44) + a color card (318) + its 16px margins
-/// above and below. The left section is shorter (~290 of content) since
-/// the swap button moved into its header row.
+/// above and below. The summary section is shorter (~290 of content)
+/// since the swap button moved into its header row.
 /// The width is set by the longest text the color field must show whole:
 /// an OkLCh value like `oklch(56.36% 0.29123 302.15)` measures ~163px in
 /// Roboto 12px, and at 840px wide the field only had 140px of text area.
@@ -138,7 +140,7 @@ const WINDOW_SIZE: [f32; 2] = [896.0, 394.0];
 /// Extra vertical space between two sliders (on top of the card's spacing).
 const SLIDER_GAP: f32 = 6.0;
 /// Space between the vertical line and the color cards.
-const RIGHT_PAD_LEFT: f32 = 28.0;
+const COLORS_PAD_LEFT: f32 = 28.0;
 /// Size of the icon buttons in the header (settings, back).
 const HEADER_BUTTON_SIZE: f32 = 28.0;
 /// Height of the logo in the header. Its wordmark fills the middle ~37%
@@ -177,7 +179,7 @@ fn bold() -> egui::FontFamily {
     egui::FontFamily::Name("roboto-bold".into())
 }
 
-/// Which color field a pick is targeting.
+/// Which color card a pick is targeting.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Target {
     Fg,
@@ -243,8 +245,8 @@ impl Channel {
         Self { name, max, step, big_step, decimals, unit }
     }
 
-    fn readout(&self, v: f64) -> String {
-        format!("{}{}", fmt_num(v, self.decimals), self.unit)
+    fn readout(&self, value: f64) -> String {
+        format!("{}{}", format_number(value, self.decimals), self.unit)
     }
 }
 
@@ -260,7 +262,7 @@ const HSL_CHANNELS: [Channel; 3] = [
 ];
 /// Chroma tops out at 0.4 because that's what CSS calls `100%`; sRGB's
 /// own maximum is ~0.32 (blue), so the top of the rail is always out of
-/// gamut — which the rail shows by flattening out.
+/// gamut, which the rail shows by flattening out.
 const OKLCH_CHANNELS: [Channel; 3] = [
     Channel::new("Lightness", 100.0, 1.0, 10.0, 1, "%"),
     Channel::new("Chroma", 0.4, 0.005, 0.05, 3, ""),
@@ -347,7 +349,7 @@ impl ColorFormat {
     ///
     /// Kept apart from [`parse_color`] (any format, to an `Rgb`) because
     /// going through 8-bit RGB would throw away exactly what the user
-    /// typed — a hue on a gray, an out-of-gamut chroma.
+    /// typed: a hue on a gray, an out-of-gamut chroma.
     fn parse(self, text: &str) -> Option<[f64; 3]> {
         match self {
             Self::Hex => {
@@ -387,7 +389,7 @@ fn parse_rgb_function(text: &str) -> Option<Rgb> {
     let g = parts.next()?.ok()?;
     let b = parts.next()?.ok()?;
     if parts.next().is_some() {
-        return None; // extra component — not a valid rgb(...)
+        return None; // extra component: not a valid rgb(...)
     }
     if r > 255 || g > 255 || b > 255 {
         return None;
@@ -403,7 +405,7 @@ fn blend(top: Rgb, alpha: u8, under: Rgb) -> Rgb {
 }
 
 /// APCA Lc as shown: the magnitude, truncated (never rounded up) to one
-/// decimal, for the same reason as [`format_ratio`] — an Lc of 74.96
+/// decimal, for the same reason as [`format_ratio`]: an Lc of 74.96
 /// fails "75+", so it must not read "75".
 ///
 /// APCA's raw value is signed (negative = light text on dark), but the
@@ -413,7 +415,7 @@ fn blend(top: Rgb, alpha: u8, under: Rgb) -> Rgb {
 /// would flip it for no visible reason.
 fn format_lc(lc: f64) -> String {
     let truncated = (lc.abs() * 10.0 + 1e-6).floor() / 10.0;
-    format!("Lc {}", fmt_num(truncated, 1))
+    format!("Lc {}", format_number(truncated, 1))
 }
 
 /// Ratio as shown to the user: truncated (never rounded up) to two
@@ -447,7 +449,7 @@ fn channel_slider(
     readout: &str,
     track: &[egui::Color32],
 ) -> bool {
-    const R: f32 = 9.0;
+    const HANDLE_RADIUS: f32 = 9.0;
 
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 2.0;
@@ -461,7 +463,7 @@ fn channel_slider(
         });
 
         let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), 2.0 * R),
+            egui::vec2(ui.available_width(), 2.0 * HANDLE_RADIUS),
             egui::Sense::click_and_drag(),
         );
         let label = format!("{a11y_prefix} {}", channel.name);
@@ -469,7 +471,7 @@ fn channel_slider(
         // `WidgetInfo::slider` only carries the raw number. The range lets
         // a screen reader place it ("50%" of the way), the step matches
         // the arrow keys, and the value text gives the units and notes the
-        // sighted readout shows — "210°", "0.258 · out of sRGB" — instead
+        // sighted readout shows ("210°", "0.258 · out of sRGB") instead
         // of a bare "210" or "0.258".
         a11y(ui, resp.id, |node| {
             node.set_min_numeric_value(0.0);
@@ -478,8 +480,8 @@ fn channel_slider(
             node.set_value(readout);
         });
 
-        let x0 = rect.left() + R;
-        let x1 = rect.right() - R;
+        let x0 = rect.left() + HANDLE_RADIUS;
+        let x1 = rect.right() - HANDLE_RADIUS;
         let mut changed = false;
         let mut set = |v: f64, value: &mut f64| {
             let v = v.clamp(0.0, channel.max);
@@ -510,7 +512,7 @@ fn channel_slider(
                     },
                 )
             });
-            let delta: f64 = ui.input_mut(|i| {
+            let delta: f64 = ui.input_mut(|input| {
                 let mut d = 0.0;
                 for (key, sign) in [
                     (egui::Key::ArrowLeft, -1.0),
@@ -518,9 +520,9 @@ fn channel_slider(
                     (egui::Key::ArrowRight, 1.0),
                     (egui::Key::ArrowUp, 1.0),
                 ] {
-                    if i.consume_key(egui::Modifiers::SHIFT, key) {
+                    if input.consume_key(egui::Modifiers::SHIFT, key) {
                         d += channel.big_step * sign;
-                    } else if i.consume_key(egui::Modifiers::NONE, key) {
+                    } else if input.consume_key(egui::Modifiers::NONE, key) {
                         d += channel.step * sign;
                     }
                 }
@@ -564,10 +566,10 @@ fn channel_slider(
         );
 
         let center = egui::pos2(cx, cy);
-        painter.circle_filled(center, R - 2.0, p.bg);
-        painter.circle_stroke(center, R - 2.0, egui::Stroke::new(2.0, p.accent));
+        painter.circle_filled(center, HANDLE_RADIUS - 2.0, p.bg);
+        painter.circle_stroke(center, HANDLE_RADIUS - 2.0, egui::Stroke::new(2.0, p.accent));
         if resp.has_focus() {
-            painter.circle_stroke(center, R + 1.0, egui::Stroke::new(2.0, p.focus));
+            painter.circle_stroke(center, HANDLE_RADIUS + 1.0, egui::Stroke::new(2.0, p.focus));
         }
 
         changed
@@ -604,15 +606,25 @@ fn eyedropper_svg_polygons() -> Vec<Vec<egui::Pos2>> {
     let mut polygons = Vec::new();
 
     while i < bytes.len() {
-        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') { i += 1; }
-        if i >= bytes.len() { break; }
-        if bytes[i].is_ascii_alphabetic() { command = bytes[i]; i += 1; }
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i].is_ascii_alphabetic() {
+            command = bytes[i];
+            i += 1;
+        }
         match command {
             b'M' | b'L' => {
                 let point = egui::pos2(number(bytes, &mut i), number(bytes, &mut i));
                 if command == b'M' {
-                    if !points.is_empty() { polygons.push(std::mem::take(&mut points)); }
+                    if !points.is_empty() {
+                        polygons.push(std::mem::take(&mut points));
+                    }
                     start = point;
+                    // Coordinates after an M's first pair are implicit L's.
                     command = b'L';
                 }
                 current = point;
@@ -623,36 +635,42 @@ fn eyedropper_svg_polygons() -> Vec<Vec<egui::Pos2>> {
                 let p1 = egui::pos2(number(bytes, &mut i), number(bytes, &mut i));
                 let p2 = egui::pos2(number(bytes, &mut i), number(bytes, &mut i));
                 let p3 = egui::pos2(number(bytes, &mut i), number(bytes, &mut i));
+                // Cubic Bézier, sampled at 8 points.
                 for step in 1..=8 {
                     let t = step as f32 / 8.0;
                     let u = 1.0 - t;
                     points.push(egui::pos2(
-                        u*u*u*p0.x + 3.0*u*u*t*p1.x + 3.0*u*t*t*p2.x + t*t*t*p3.x,
-                        u*u*u*p0.y + 3.0*u*u*t*p1.y + 3.0*u*t*t*p2.y + t*t*t*p3.y,
+                        u * u * u * p0.x + 3.0 * u * u * t * p1.x + 3.0 * u * t * t * p2.x + t * t * t * p3.x,
+                        u * u * u * p0.y + 3.0 * u * u * t * p1.y + 3.0 * u * t * t * p2.y + t * t * t * p3.y,
                     ));
                 }
                 current = p3;
             }
             b'z' | b'Z' => {
                 current = start;
-                if !points.is_empty() { polygons.push(std::mem::take(&mut points)); }
+                if !points.is_empty() {
+                    polygons.push(std::mem::take(&mut points));
+                }
                 command = b' ';
             }
             _ => break,
         }
     }
-    if !points.is_empty() { polygons.push(points); }
+    if !points.is_empty() {
+        polygons.push(points);
+    }
     polygons
 }
 
 fn paint_eyedropper(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    // Render the SVG path 18 px wide, centered inside the hit target.
-    // The visible path spans approximately 526 units in the 640 x 640 viewBox.
+    // Renders the SVG path 18px wide, centered inside the hit target.
+    // The visible path spans about 526 units of the 640×640 viewBox.
     let scale = 18.0 / 526.0;
     let origin = rect.center() - egui::vec2(323.0 * scale, 315.0 * scale);
     for polygon in eyedropper_svg_polygons() {
-        let points = polygon.into_iter()
-            .map(|p| origin + egui::vec2(p.x * scale, p.y * scale))
+        let points = polygon
+            .into_iter()
+            .map(|point| origin + egui::vec2(point.x * scale, point.y * scale))
             .collect();
         painter.add(egui::Shape::Path(egui::epaint::PathShape {
             points,
@@ -663,43 +681,42 @@ fn paint_eyedropper(painter: &egui::Painter, rect: egui::Rect, color: egui::Colo
     }
 }
 
-/// A double arrow (⇄) drawn with strokes, like the eyedropper: no icon
-/// font needed.
+/// A double arrow (⇄) drawn with strokes: no icon font needed.
 fn paint_swap(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let c = rect.center();
-    let p = |x: f32, y: f32| c + egui::vec2(x, y);
-    let s = egui::Stroke::new(2.0, color);
+    let center = rect.center();
+    let at = |x: f32, y: f32| center + egui::vec2(x, y);
+    let stroke = egui::Stroke::new(2.0, color);
     // Top arrow, pointing right.
-    painter.line_segment([p(-9.0, -4.0), p(9.0, -4.0)], s);
-    painter.line_segment([p(5.0, -8.0), p(9.0, -4.0)], s);
-    painter.line_segment([p(5.0, 0.0), p(9.0, -4.0)], s);
+    painter.line_segment([at(-9.0, -4.0), at(9.0, -4.0)], stroke);
+    painter.line_segment([at(5.0, -8.0), at(9.0, -4.0)], stroke);
+    painter.line_segment([at(5.0, 0.0), at(9.0, -4.0)], stroke);
     // Bottom arrow, pointing left.
-    painter.line_segment([p(9.0, 4.0), p(-9.0, 4.0)], s);
-    painter.line_segment([p(-5.0, 0.0), p(-9.0, 4.0)], s);
-    painter.line_segment([p(-5.0, 8.0), p(-9.0, 4.0)], s);
+    painter.line_segment([at(9.0, 4.0), at(-9.0, 4.0)], stroke);
+    painter.line_segment([at(-5.0, 0.0), at(-9.0, 4.0)], stroke);
+    painter.line_segment([at(-5.0, 8.0), at(-9.0, 4.0)], stroke);
 }
 
 /// Gear icon (settings), drawn with strokes: a thick ring for the body
 /// and eight short, thick spokes past it for the teeth.
 fn paint_gear(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let c = rect.center();
-    painter.circle_stroke(c, 5.0, egui::Stroke::new(3.0, color));
+    let center = rect.center();
+    painter.circle_stroke(center, 5.0, egui::Stroke::new(3.0, color));
     let teeth = egui::Stroke::new(3.2, color);
     for i in 0..8 {
-        let a = i as f32 * std::f32::consts::FRAC_PI_4 + std::f32::consts::FRAC_PI_8;
-        let dir = egui::vec2(a.cos(), a.sin());
-        painter.line_segment([c + dir * 6.0, c + dir * 9.0], teeth);
+        let angle = i as f32 * std::f32::consts::FRAC_PI_4 + std::f32::consts::FRAC_PI_8;
+        let dir = egui::vec2(angle.cos(), angle.sin());
+        painter.line_segment([center + dir * 6.0, center + dir * 9.0], teeth);
     }
 }
 
 /// Left arrow (back), like flax's settings header.
 fn paint_back_arrow(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let c = rect.center();
-    let p = |x: f32, y: f32| c + egui::vec2(x, y);
-    let s = egui::Stroke::new(2.0, color);
-    painter.line_segment([p(-7.0, 0.0), p(7.0, 0.0)], s);
-    painter.line_segment([p(-7.0, 0.0), p(-2.0, -5.0)], s);
-    painter.line_segment([p(-7.0, 0.0), p(-2.0, 5.0)], s);
+    let center = rect.center();
+    let at = |x: f32, y: f32| center + egui::vec2(x, y);
+    let stroke = egui::Stroke::new(2.0, color);
+    painter.line_segment([at(-7.0, 0.0), at(7.0, 0.0)], stroke);
+    painter.line_segment([at(-7.0, 0.0), at(-2.0, -5.0)], stroke);
+    painter.line_segment([at(-7.0, 0.0), at(-2.0, 5.0)], stroke);
 }
 
 /// Frameless, icon-only square button (swap, settings, back): neutral
@@ -749,7 +766,7 @@ fn icon_button(
 /// - Opened from the keyboard (Space/Enter): focus moves onto the current
 ///   option, so it shows where the user is and arrows go on from there.
 ///   egui would leave it on the button, where nothing marks it while the
-///   list covers the page — it reads as lost.
+///   list covers the page: it reads as lost.
 /// - Open: arrows move between the options only (see [`list_arrow_keys`]).
 /// - Enter/Space on an option picks it and closes the list. egui's
 ///   `CloseOnClick` only counts pointer clicks, so it would stay open.
@@ -775,12 +792,12 @@ fn select_box<T: Copy + PartialEq>(
     let mut changed = false;
     let inner = combo.show_ui(ui, |ui| {
         for &v in all {
-            let r = ui.selectable_value(value, v, option_text(v));
-            changed |= r.changed();
-            if r.clicked() && !r.clicked_by(egui::PointerButton::Primary) {
+            let option = ui.selectable_value(value, v, option_text(v));
+            changed |= option.changed();
+            if option.clicked() && !option.clicked_by(egui::PointerButton::Primary) {
                 ui.close();
             }
-            option_ids.push(r.id);
+            option_ids.push(option.id);
         }
         let selected = all.iter().position(|v| v == value);
         list_arrow_keys(ui, &option_ids, button_id, selected);
@@ -790,12 +807,12 @@ fn select_box<T: Copy + PartialEq>(
     ui.data_mut(|d| d.insert_temp(button_key, resp.id));
 
     if !open && resp.has_focus() {
-        let step: isize = ui.input_mut(|i| {
+        let step: isize = ui.input_mut(|input| {
             let mut d = 0;
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
                 d -= 1;
             }
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
                 d += 1;
             }
             d
@@ -815,13 +832,13 @@ fn select_box<T: Copy + PartialEq>(
         }
     }
 
-    let key = resp.id.with("colza-select-focus");
+    let focus_key = resp.id.with("colza-select-focus");
     let focused = ui.memory(|m| m.focused());
     if open {
         if let Some(f) = focused.filter(|f| *f == resp.id || option_ids.contains(f)) {
-            ui.data_mut(|d| d.insert_temp(key, Some(f)));
+            ui.data_mut(|d| d.insert_temp(focus_key, Some(f)));
         }
-    } else if let Some(last) = ui.data_mut(|d| d.remove_temp::<Option<egui::Id>>(key)).flatten() {
+    } else if let Some(last) = ui.data_mut(|d| d.remove_temp::<Option<egui::Id>>(focus_key)).flatten() {
         if focused.is_none() || focused == Some(last) {
             ui.memory_mut(|m| m.request_focus(resp.id));
         }
@@ -858,20 +875,20 @@ fn list_arrow_keys(
     if current.is_none() && (focused.is_none() || focused != button) {
         return;
     }
-    let (step, home, end, sideways) = ui.input_mut(|i| {
+    let (step, home, end, sideways) = ui.input_mut(|input| {
         let mut d = 0isize;
-        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+        if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
             d -= 1;
         }
-        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+        if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
             d += 1;
         }
         (
             d,
-            i.consume_key(egui::Modifiers::NONE, egui::Key::Home),
-            i.consume_key(egui::Modifiers::NONE, egui::Key::End),
-            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
-                | i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+            input.consume_key(egui::Modifiers::NONE, egui::Key::Home),
+            input.consume_key(egui::Modifiers::NONE, egui::Key::End),
+            input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
+                | input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
         )
     });
     let target = if home {
@@ -916,7 +933,7 @@ fn radio_group<T: Copy + PartialEq>(
     value: &mut T,
     options: &[(T, &str, &str)],
 ) -> bool {
-    const CIRCLE_R: f32 = 7.0;
+    const CIRCLE_RADIUS: f32 = 7.0;
     const TEXT_X: f32 = 26.0;
 
     ui.scope(|ui| {
@@ -933,18 +950,19 @@ fn radio_group<T: Copy + PartialEq>(
         let width = ui.available_width();
 
         for (i, (_, label, description)) in options.iter().enumerate() {
-            let label_g = ui.painter().layout_no_wrap(
+            let label_galley = ui.painter().layout_no_wrap(
                 (*label).to_owned(),
                 egui::FontId::proportional(13.0),
                 p.text,
             );
-            let desc_g = ui.painter().layout(
+            let description_galley = ui.painter().layout(
                 (*description).to_owned(),
                 egui::FontId::proportional(12.0),
                 p.text_secondary,
                 width - TEXT_X,
             );
-            let height = label_g.size().y + 2.0 + desc_g.size().y;
+            let label_height = label_galley.size().y;
+            let height = label_height + 2.0 + description_galley.size().y;
             let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
             let resp = ui.interact(rect, ids[i], egui::Sense::click());
 
@@ -952,22 +970,22 @@ fn radio_group<T: Copy + PartialEq>(
             resp.widget_info(|| {
                 egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, is_selected, *label)
             });
-            let desc = (*description).to_owned();
-            a11y(ui, resp.id, |node| node.set_description(desc));
+            let description_text = (*description).to_owned();
+            a11y(ui, resp.id, |node| node.set_description(description_text));
 
             if resp.clicked() {
                 selected = Some(i);
             }
             if resp.has_focus() {
-                let step: isize = ui.input_mut(|inp| {
+                let step: isize = ui.input_mut(|input| {
                     let mut d = 0;
-                    for k in [egui::Key::ArrowUp, egui::Key::ArrowLeft] {
-                        if inp.consume_key(egui::Modifiers::NONE, k) {
+                    for key in [egui::Key::ArrowUp, egui::Key::ArrowLeft] {
+                        if input.consume_key(egui::Modifiers::NONE, key) {
                             d -= 1;
                         }
                     }
-                    for k in [egui::Key::ArrowDown, egui::Key::ArrowRight] {
-                        if inp.consume_key(egui::Modifiers::NONE, k) {
+                    for key in [egui::Key::ArrowDown, egui::Key::ArrowRight] {
+                        if input.consume_key(egui::Modifiers::NONE, key) {
                             d += 1;
                         }
                     }
@@ -982,7 +1000,7 @@ fn radio_group<T: Copy + PartialEq>(
 
             // Drawn with this frame's selection, so a click shows at once.
             let on = selected == Some(i);
-            let center = egui::pos2(rect.left() + CIRCLE_R + 1.0, rect.top() + label_g.size().y / 2.0);
+            let center = egui::pos2(rect.left() + CIRCLE_RADIUS + 1.0, rect.top() + label_height / 2.0);
             let ring = if on {
                 p.accent
             } else if resp.hovered() {
@@ -990,16 +1008,15 @@ fn radio_group<T: Copy + PartialEq>(
             } else {
                 p.text_secondary
             };
-            ui.painter().circle_stroke(center, CIRCLE_R, egui::Stroke::new(1.5, ring));
+            ui.painter().circle_stroke(center, CIRCLE_RADIUS, egui::Stroke::new(1.5, ring));
             if on {
-                ui.painter().circle_filled(center, CIRCLE_R - 3.0, p.accent);
+                ui.painter().circle_filled(center, CIRCLE_RADIUS - 3.0, p.accent);
             }
             let text_x = rect.left() + TEXT_X;
-            let label_h = label_g.size().y;
-            ui.painter().galley(egui::pos2(text_x, rect.top()), label_g, p.text);
+            ui.painter().galley(egui::pos2(text_x, rect.top()), label_galley, p.text);
             ui.painter().galley(
-                egui::pos2(text_x, rect.top() + label_h + 2.0),
-                desc_g,
+                egui::pos2(text_x, rect.top() + label_height + 2.0),
+                description_galley,
                 p.text_secondary,
             );
             if resp.has_focus() {
@@ -1037,7 +1054,7 @@ fn keycap(ui: &mut egui::Ui, p: &Palette, key: &str) {
 
 /// GitHub's official marks, as downloaded from https://github.com/logos
 /// (`github-mark.png` and `github-mark-white.png` in its archive). Kept
-/// unmodified, as GitHub's usage terms require — no recoloring, so the
+/// unmodified, as GitHub's usage terms require: no recoloring, so the
 /// hover state below changes the background only, never the mark.
 const GITHUB_MARK: &[u8] = include_bytes!("../assets/github-mark.png");
 const GITHUB_MARK_WHITE: &[u8] = include_bytes!("../assets/github-mark-white.png");
@@ -1048,10 +1065,11 @@ const GITHUB_MARK_WHITE: &[u8] = include_bytes!("../assets/github-mark-white.png
 ///
 /// - `colza-light.svg` → `logo-colza.png`: the four pictogram colors
 ///   darkened in OkLCh lightness, hue kept, since the original yellow
-///   (#EFFF2A) is 1.01:1 against the light header (#F1F3F4) — invisible.
-///   Each was lowered to a set contrast, keeping the original yellow →
-///   green progression: #EFFF2A → #CBD908 (1.4:1), #D3F340 → #B7D505
-///   (1.5:1), #B6E656 → #A0CE3A (1.65:1), #9ADA6C → #89C85A (1.8:1).
+///   (#EFFF2A) is 1.01:1 against the light header (#F1F3F4), i.e.
+///   invisible. Each was lowered to a set contrast, keeping the original
+///   yellow → green progression: #EFFF2A → #CBD908 (1.4:1), #D3F340 →
+///   #B7D505 (1.5:1), #B6E656 → #A0CE3A (1.65:1), #9ADA6C → #89C85A
+///   (1.8:1).
 /// - `colza-dark.svg` → `logo-colza-dark.png`: the same four colors as
 ///   `colza-light.svg`, so the logo looks the same in both themes (7.2:1
 ///   and up on the dark header), with the wordmark's black (`.cls-3`)
@@ -1078,27 +1096,27 @@ fn embedded_texture(
     bytes: &'static [u8],
 ) -> Option<egui::TextureHandle> {
     let id = egui::Id::new(("embedded-texture", name));
-    if let Some(tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
-        return Some(tex);
+    if let Some(texture) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return Some(texture);
     }
-    let img = match image::load_from_memory(bytes) {
-        Ok(img) => img.to_rgba8(),
+    let decoded = match image::load_from_memory(bytes) {
+        Ok(decoded) => decoded.to_rgba8(),
         Err(err) => {
             eprintln!("colza: could not decode {name}: {err}");
             return None;
         }
     };
-    let size = [img.width() as usize, img.height() as usize];
-    let tex = ctx.load_texture(
+    let size = [decoded.width() as usize, decoded.height() as usize];
+    let texture = ctx.load_texture(
         name,
-        egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()),
+        egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw()),
         egui::TextureOptions {
             mipmap_mode: Some(egui::TextureFilter::Linear),
             ..egui::TextureOptions::LINEAR
         },
     );
-    ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
-    Some(tex)
+    ctx.data_mut(|d| d.insert_temp(id, texture.clone()));
+    Some(texture)
 }
 
 /// The GitHub mark for the current theme (black on light, white on dark).
@@ -1111,30 +1129,30 @@ fn github_mark(ctx: &egui::Context, dark: bool) -> Option<egui::TextureHandle> {
 }
 
 /// The window's title: the colza logo for the current theme, exposed to
-/// assistive tech as the level-1 heading "colza" — its text alternative,
-/// and the same heading the plain-text title used to give. Falls back to
+/// assistive tech as the level-1 heading "colza" (its text alternative,
+/// and the same heading the plain-text title used to give). Falls back to
 /// that text title if the image can't be decoded.
 fn logo(ui: &mut egui::Ui, p: &Palette) {
     const NAME: &str = "colza";
-    let tex = if ui.visuals().dark_mode {
+    let texture = if ui.visuals().dark_mode {
         embedded_texture(ui.ctx(), "logo-colza-dark", LOGO_DARK)
     } else {
         embedded_texture(ui.ctx(), "logo-colza", LOGO)
     };
-    let Some(tex) = tex else {
+    let Some(texture) = texture else {
         let title = ui.label(egui::RichText::new(NAME).size(12.0).family(bold()).color(p.text));
         mark_heading(ui, title.id, 1, NAME);
         return;
     };
     let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(LOGO_HEIGHT * tex.aspect_ratio(), LOGO_HEIGHT),
+        egui::vec2(LOGO_HEIGHT * texture.aspect_ratio(), LOGO_HEIGHT),
         egui::Sense::hover(),
     );
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Image, true, NAME));
     // After `widget_info`, which would otherwise reset the role to image.
     mark_heading(ui, resp.id, 1, NAME);
     ui.painter().image(
-        tex.id(),
+        texture.id(),
         rect,
         egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,
@@ -1146,7 +1164,7 @@ fn logo(ui: &mut egui::Ui, p: &Palette) {
 /// since the mark has no text.
 fn github_link(ui: &mut egui::Ui, p: &Palette, url: &str) {
     const NAME: &str = "colza on GitHub";
-    let Some(tex) = github_mark(ui.ctx(), ui.visuals().dark_mode) else {
+    let Some(texture) = github_mark(ui.ctx(), ui.visuals().dark_mode) else {
         return;
     };
     let (rect, resp) = ui.allocate_exact_size(
@@ -1161,10 +1179,10 @@ fn github_link(ui: &mut egui::Ui, p: &Palette, url: &str) {
     }
     let icon = egui::Rect::from_center_size(
         rect.center(),
-        egui::vec2(20.0 * tex.aspect_ratio(), 20.0),
+        egui::vec2(20.0 * texture.aspect_ratio(), 20.0),
     );
     ui.painter().image(
-        tex.id(),
+        texture.id(),
         icon,
         egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE, // no tint: the mark is shown as GitHub ships it
@@ -1230,7 +1248,7 @@ fn a11y(ui: &egui::Ui, id: egui::Id, edit: impl FnOnce(&mut egui::accesskit::Nod
 /// font.
 ///
 /// The name is set explicitly: egui puts a label's text in its *value*,
-/// which is where a label's name comes from, but not a heading's — left
+/// which is where a label's name comes from, but not a heading's. Left
 /// alone, it would be announced as "heading level 1" with no text.
 fn mark_heading(ui: &egui::Ui, id: egui::Id, level: usize, text: &str) {
     a11y(ui, id, |node| {
@@ -1246,8 +1264,8 @@ fn mark_heading(ui: &egui::Ui, id: egui::Id, level: usize, text: &str) {
 ///
 /// Built as a radio group for assistive tech, since that's what it is: a
 /// `RadioGroup` named `group`, containing one radio button per segment
-/// with its checked state. Keyboard follows the ARIA radio-group pattern as far
-/// as egui allows: arrows move the selection *and* focus to the
+/// with its checked state. Keyboard follows the ARIA radio-group pattern
+/// as far as egui allows: arrows move the selection *and* focus to the
 /// neighboring segment (wrapping), Space/Enter select the focused one.
 /// (ARIA would also take unselected segments out of the Tab order; egui
 /// has no way to make a clickable widget unfocusable, so Tab visits both.)
@@ -1275,114 +1293,114 @@ fn segmented_control<T: Copy + PartialEq>(
     let widths: Vec<f32> = options
         .iter()
         .map(|(_, label)| {
-            let g = ui.painter().layout_no_wrap((*label).to_owned(), font(true), p.text);
-            g.size().x + 2.0 * PAD_X
+            let galley = ui.painter().layout_no_wrap((*label).to_owned(), font(true), p.text);
+            galley.size().x + 2.0 * PAD_X
         })
         .collect();
     let total = widths.iter().sum::<f32>() + 2.0 * INSET;
 
-    // The segments live in a child `Ui` so that its AccessKit node — the
-    // container egui makes for every `Ui` — can become the radio group
+    // The segments live in a child `Ui` so that its AccessKit node (the
+    // container egui makes for every `Ui`) can become the radio group
     // they're announced as part of ("Contrast method, radio group").
     ui.scope(|ui| {
-    a11y(ui, ui.unique_id(), |node| {
-        node.set_role(egui::accesskit::Role::RadioGroup);
-        node.set_label(group);
-    });
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(total, HEIGHT), egui::Sense::hover());
-
-    ui.painter().rect_filled(rect, RADIUS, p.toolbar_bg);
-    ui.painter().rect_stroke(
-        rect,
-        RADIUS,
-        egui::Stroke::new(1.0_f32, p.border),
-        egui::StrokeKind::Inside,
-    );
-
-    let base_id = ui.id().with(("segmented", group));
-    let ids: Vec<egui::Id> = (0..options.len()).map(|i| base_id.with(i)).collect();
-    let mut selected = options.iter().position(|(v, _)| v == value);
-    let before = selected;
-    let mut x = rect.left() + INSET;
-
-    for (i, ((_, label), w)) in options.iter().zip(&widths).enumerate() {
-        let seg = egui::Rect::from_min_size(
-            egui::pos2(x, rect.top() + INSET),
-            egui::vec2(*w, HEIGHT - 2.0 * INSET),
-        );
-        x += w;
-        let resp = ui.interact(seg, ids[i], egui::Sense::click());
-        let is_selected = selected == Some(i);
-        resp.widget_info(|| {
-            egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, is_selected, *label)
+        a11y(ui, ui.unique_id(), |node| {
+            node.set_role(egui::accesskit::Role::RadioGroup);
+            node.set_label(group);
         });
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(total, HEIGHT), egui::Sense::hover());
 
-        if resp.clicked() {
-            selected = Some(i);
-        }
-        if resp.has_focus() {
-            ui.memory_mut(|m| {
-                m.set_focus_lock_filter(
-                    resp.id,
-                    egui::EventFilter { horizontal_arrows: true, ..Default::default() },
-                )
+        ui.painter().rect_filled(rect, RADIUS, p.toolbar_bg);
+        ui.painter().rect_stroke(
+            rect,
+            RADIUS,
+            egui::Stroke::new(1.0_f32, p.border),
+            egui::StrokeKind::Inside,
+        );
+
+        let base_id = ui.id().with(("segmented", group));
+        let ids: Vec<egui::Id> = (0..options.len()).map(|i| base_id.with(i)).collect();
+        let mut selected = options.iter().position(|(v, _)| v == value);
+        let before = selected;
+        let mut x = rect.left() + INSET;
+
+        for (i, ((_, label), width)) in options.iter().zip(&widths).enumerate() {
+            let segment = egui::Rect::from_min_size(
+                egui::pos2(x, rect.top() + INSET),
+                egui::vec2(*width, HEIGHT - 2.0 * INSET),
+            );
+            x += width;
+            let resp = ui.interact(segment, ids[i], egui::Sense::click());
+            let is_selected = selected == Some(i);
+            resp.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, is_selected, *label)
             });
-            // Only reads input inside the closure (see magnifier.rs on
-            // egui's input lock); focus moves after it returns.
-            let step: isize = ui.input_mut(|inp| {
-                let mut d = 0;
-                if inp.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
-                    d -= 1;
+
+            if resp.clicked() {
+                selected = Some(i);
+            }
+            if resp.has_focus() {
+                ui.memory_mut(|m| {
+                    m.set_focus_lock_filter(
+                        resp.id,
+                        egui::EventFilter { horizontal_arrows: true, ..Default::default() },
+                    )
+                });
+                // Only reads input inside the closure (see magnifier.rs on
+                // egui's input lock); focus moves after it returns.
+                let step: isize = ui.input_mut(|input| {
+                    let mut d = 0;
+                    if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+                        d -= 1;
+                    }
+                    if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+                        d += 1;
+                    }
+                    d
+                });
+                if step != 0 {
+                    let n = options.len() as isize;
+                    let j = (i as isize + step).rem_euclid(n) as usize;
+                    selected = Some(j);
+                    ui.memory_mut(|m| m.request_focus(ids[j]));
                 }
-                if inp.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
-                    d += 1;
-                }
-                d
-            });
-            if step != 0 {
-                let n = options.len() as isize;
-                let j = (i as isize + step).rem_euclid(n) as usize;
-                selected = Some(j);
-                ui.memory_mut(|m| m.request_focus(ids[j]));
+            }
+
+            // Drawn with this frame's selection, so a click shows at once.
+            let shown_selected = selected == Some(i);
+            if shown_selected {
+                ui.painter().rect_filled(segment, RADIUS - 1.0, p.bg);
+                ui.painter().rect_stroke(
+                    segment,
+                    RADIUS - 1.0,
+                    egui::Stroke::new(1.5_f32, p.text),
+                    egui::StrokeKind::Inside,
+                );
+            } else if resp.hovered() {
+                ui.painter().rect_filled(segment, RADIUS - 1.0, ICON_HOVER);
+            }
+            let color = if shown_selected || resp.hovered() { p.text } else { p.text_secondary };
+            let galley = ui
+                .painter()
+                .layout_no_wrap((*label).to_owned(), font(shown_selected), color);
+            ui.painter()
+                .galley(segment.center() - galley.size() / 2.0, galley, color);
+            if resp.has_focus() {
+                ui.painter().rect_stroke(
+                    segment,
+                    RADIUS - 1.0,
+                    egui::Stroke::new(2.0, p.focus),
+                    egui::StrokeKind::Outside,
+                );
             }
         }
 
-        // Drawn with this frame's selection, so a click shows at once.
-        let shown_selected = selected == Some(i);
-        if shown_selected {
-            ui.painter().rect_filled(seg, RADIUS - 1.0, p.bg);
-            ui.painter().rect_stroke(
-                seg,
-                RADIUS - 1.0,
-                egui::Stroke::new(1.5_f32, p.text),
-                egui::StrokeKind::Inside,
-            );
-        } else if resp.hovered() {
-            ui.painter().rect_filled(seg, RADIUS - 1.0, ICON_HOVER);
+        match selected {
+            Some(i) if selected != before => {
+                *value = options[i].0;
+                true
+            }
+            _ => false,
         }
-        let color = if shown_selected || resp.hovered() { p.text } else { p.text_secondary };
-        let galley = ui
-            .painter()
-            .layout_no_wrap((*label).to_owned(), font(shown_selected), color);
-        ui.painter()
-            .galley(seg.center() - galley.size() / 2.0, galley, color);
-        if resp.has_focus() {
-            ui.painter().rect_stroke(
-                seg,
-                RADIUS - 1.0,
-                egui::Stroke::new(2.0, p.focus),
-                egui::StrokeKind::Outside,
-            );
-        }
-    }
-
-    match selected {
-        Some(i) if selected != before => {
-            *value = options[i].0;
-            true
-        }
-        _ => false,
-    }
     })
     .inner
 }
@@ -1430,9 +1448,9 @@ fn card<R>(
         .inner
 }
 
-/// One color card: title + format dropdown, swatch + text + eyedropper,
-/// then the format's three sliders and Alpha.
-struct ColorRowState {
+/// State of one color card: title + format dropdown, swatch + text +
+/// eyedropper, then the format's three sliders and Alpha.
+struct ColorCard {
     label: &'static str,
     /// The color used for contrast. Always equal to
     /// `format.to_rgb(components).0`.
@@ -1458,9 +1476,9 @@ struct ColorRowState {
     text: String,
 }
 
-impl ColorRowState {
+impl ColorCard {
     fn new(label: &'static str, color: Rgb) -> Self {
-        let mut row = Self {
+        let mut card = Self {
             label,
             color,
             alpha: 255,
@@ -1469,8 +1487,8 @@ impl ColorRowState {
             out_of_gamut: false,
             text: String::new(),
         };
-        row.set_rgb(color);
-        row
+        card.set_rgb(color);
+        card
     }
 
     fn sync_text(&mut self) {
@@ -1494,7 +1512,7 @@ impl ColorRowState {
     }
 
     /// Used by the picker: a sampled screen pixel is always opaque.
-    fn set_color(&mut self, color: Rgb) {
+    fn set_picked_color(&mut self, color: Rgb) {
         self.alpha = 255;
         self.set_rgb(color);
     }
@@ -1504,15 +1522,15 @@ impl ColorRowState {
     /// RGB (each channel is linear in sRGB, as the mesh interpolates);
     /// HSL and OkLCh curve, so they get enough stops to look smooth.
     fn track(&self, i: usize) -> Vec<egui::Color32> {
-        let n = match self.format {
+        let stops = match self.format {
             ColorFormat::Hex | ColorFormat::Rgb => 2,
             ColorFormat::Hsl | ColorFormat::Oklch => 25,
         };
         let max = self.format.channels()[i].max;
-        (0..n)
+        (0..stops)
             .map(|k| {
                 let mut v = self.components;
-                v[i] = max * k as f64 / (n - 1) as f64;
+                v[i] = max * k as f64 / (stops - 1) as f64;
                 color32(self.format.to_rgb(v).0)
             })
             .collect()
@@ -1596,10 +1614,10 @@ impl ColorRowState {
             let name = format!("{} color value", self.label);
             a11y(ui, field.id, |node| node.set_label(name));
             if field.changed() {
-                // Live-parse as the user types: update color if valid,
-                // leave the text alone either way. Text in the row's own
-                // format sets the sliders to exactly what was typed;
-                // any other format goes through RGB.
+                // Live-parse as the user types: update the color if valid,
+                // leave the text alone either way. Text in the card's own
+                // format sets the sliders to exactly what was typed; any
+                // other format goes through RGB.
                 if let Some(v) = self.format.parse(&self.text) {
                     self.set_components(v);
                 } else if let Some(parsed) = parse_color(&self.text) {
@@ -1616,11 +1634,11 @@ impl ColorRowState {
 
             // Frameless eyedropper: allocate the hit target directly so no
             // button background can appear on press or focus.
-            let (icon_rect, btn) = ui.allocate_exact_size(
+            let (icon_rect, pick_button) = ui.allocate_exact_size(
                 egui::vec2(CONTROL_SIZE, CONTROL_SIZE),
                 if picking { egui::Sense::hover() } else { egui::Sense::click() },
             );
-            if btn.hovered() && !picking {
+            if pick_button.hovered() && !picking {
                 ui.painter().rect_filled(icon_rect, 6.0, ICON_HOVER);
             }
             let icon_color = if picking {
@@ -1629,7 +1647,7 @@ impl ColorRowState {
                 p.text_secondary
             };
             paint_eyedropper(ui.painter(), icon_rect, icon_color);
-            if btn.has_focus() {
+            if pick_button.has_focus() {
                 ui.painter().rect_stroke(
                     icon_rect,
                     6.0,
@@ -1638,10 +1656,10 @@ impl ColorRowState {
                 );
             }
             let name = format!("Pick {} color from screen", self.label.to_lowercase());
-            btn.widget_info(|| {
+            pick_button.widget_info(|| {
                 egui::WidgetInfo::labeled(egui::WidgetType::Button, !picking, name.clone())
             });
-            if btn.on_hover_text("Pick color from screen").clicked() {
+            if pick_button.on_hover_text("Pick color from screen").clicked() {
                 on_pick();
             }
         });
@@ -1673,7 +1691,12 @@ impl ColorRowState {
         let mut alpha = self.alpha as f64;
         let alpha_readout = format!("{}%", (alpha / 255.0 * 100.0).round());
         if channel_slider(
-            ui, p, &ALPHA_CHANNEL, self.label, &mut alpha, &alpha_readout,
+            ui,
+            p,
+            &ALPHA_CHANNEL,
+            self.label,
+            &mut alpha,
+            &alpha_readout,
             &[p.bg, color32(self.color)],
         ) {
             self.alpha = alpha.round() as u8;
@@ -1683,7 +1706,7 @@ impl ColorRowState {
     }
 }
 
-/// Which contrast method the left section evaluates.
+/// Which contrast method the summary section evaluates.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Method {
     Wcag2,
@@ -1693,7 +1716,7 @@ enum Method {
 impl Method {
     fn criteria(self) -> &'static [Criterion; 5] {
         match self {
-            Self::Wcag2 => &CRITERIA,
+            Self::Wcag2 => &WCAG2_CRITERIA,
             Self::Apca => &APCA_CRITERIA,
         }
     }
@@ -1701,36 +1724,37 @@ impl Method {
 
 /// One criterion row: a WCAG ratio or an APCA Lc level.
 struct Criterion {
-    ratio_text: &'static str,
+    /// The threshold as shown: "4.5:1" or "Lc 75".
+    threshold_text: &'static str,
     label: &'static str,
     /// Compared against the ratio (WCAG) or |Lc| (APCA).
     threshold: f64,
 }
 
+const WCAG2_CRITERIA: [Criterion; 5] = [
+    Criterion { threshold_text: "3:1", label: "UI (AA)", threshold: 3.0 },
+    Criterion { threshold_text: "3:1", label: "Large text (AA)", threshold: 3.0 },
+    Criterion { threshold_text: "4.5:1", label: "Regular text (AA)", threshold: 4.5 },
+    Criterion { threshold_text: "4.5:1", label: "Large text (AAA)", threshold: 4.5 },
+    Criterion { threshold_text: "7:1", label: "Regular text (AAA)", threshold: 7.0 },
+];
+
 /// APCA's simplified ("bronze") use levels. They're minimums by use
 /// case; APCA's full guidance also ties each level to font size and
 /// weight, which this summary doesn't attempt.
 const APCA_CRITERIA: [Criterion; 5] = [
-    Criterion { ratio_text: "Lc 30", label: "Non-essential text", threshold: 30.0 },
-    Criterion { ratio_text: "Lc 45", label: "Larger text, non-text UI", threshold: 45.0 },
-    Criterion { ratio_text: "Lc 60", label: "Large / bold text", threshold: 60.0 },
-    Criterion { ratio_text: "Lc 75", label: "Body text", threshold: 75.0 },
-    Criterion { ratio_text: "Lc 90", label: "Preferred body text", threshold: 90.0 },
-];
-
-const CRITERIA: [Criterion; 5] = [
-    Criterion { ratio_text: "3:1", label: "UI (AA)", threshold: 3.0 },
-    Criterion { ratio_text: "3:1", label: "Large text (AA)", threshold: 3.0 },
-    Criterion { ratio_text: "4.5:1", label: "Regular text (AA)", threshold: 4.5 },
-    Criterion { ratio_text: "4.5:1", label: "Large text (AAA)", threshold: 4.5 },
-    Criterion { ratio_text: "7:1", label: "Regular text (AAA)", threshold: 7.0 },
+    Criterion { threshold_text: "Lc 30", label: "Non-essential text", threshold: 30.0 },
+    Criterion { threshold_text: "Lc 45", label: "Larger text, non-text UI", threshold: 45.0 },
+    Criterion { threshold_text: "Lc 60", label: "Large / bold text", threshold: 60.0 },
+    Criterion { threshold_text: "Lc 75", label: "Body text", threshold: 75.0 },
+    Criterion { threshold_text: "Lc 90", label: "Preferred body text", threshold: 90.0 },
 ];
 
 struct App {
     mode: Mode,
     method: Method,
-    bg: ColorRowState,
-    fg: ColorRowState,
+    bg: ColorCard,
+    fg: ColorCard,
     /// The desktop's text-size factor (`text_scale.rs`), 1.0 = default.
     text_scale: f32,
     /// Live updates to `text_scale` from the portal watcher.
@@ -1743,7 +1767,7 @@ struct App {
     prefs: crate::prefs::Prefs,
     /// Whether a screencast restore token is saved; read when the
     /// settings page opens and after "Forget", not every frame.
-    has_token: bool,
+    has_restore_token: bool,
     /// Widget to focus at the start of the next frame (see `navigate`).
     pending_focus: Option<egui::Id>,
 }
@@ -1753,8 +1777,8 @@ impl Default for App {
         Self {
             mode: Mode::Normal,
             method: Method::Wcag2,
-            bg: ColorRowState::new("Background", Rgb::new(0xFF, 0xFF, 0xFF)),
-            fg: ColorRowState::new("Foreground", Rgb::new(0x00, 0x00, 0x00)),
+            bg: ColorCard::new("Background", Rgb::new(0xFF, 0xFF, 0xFF)),
+            fg: ColorCard::new("Foreground", Rgb::new(0x00, 0x00, 0x00)),
             text_scale: 1.0,
             // A receiver whose sender is already gone: never yields.
             text_scale_rx: std::sync::mpsc::channel().1,
@@ -1762,7 +1786,7 @@ impl Default for App {
             applied_zoom: 1.0,
             page: Page::Main,
             prefs: crate::prefs::Prefs::default(),
-            has_token: false,
+            has_restore_token: false,
             pending_focus: None,
         }
     }
@@ -1770,14 +1794,14 @@ impl Default for App {
 
 impl App {
     /// Colors as actually seen: the background over white, the foreground
-    /// over that background.
-    fn effective(&self) -> (Rgb, Rgb) {
+    /// over that background. Returns `(bg, fg)`.
+    fn effective_colors(&self) -> (Rgb, Rgb) {
         let bg = blend(self.bg.color, self.bg.alpha, Rgb::new(0xFF, 0xFF, 0xFF));
         let fg = blend(self.fg.color, self.fg.alpha, bg);
         (bg, fg)
     }
 
-    /// Exchanges foreground and background (color and alpha). Each row
+    /// Exchanges foreground and background (color and alpha). Each card
     /// keeps its own text format.
     fn swap_colors(&mut self) {
         std::mem::swap(&mut self.fg.alpha, &mut self.bg.alpha);
@@ -1800,7 +1824,7 @@ impl App {
     /// Kicks off the pick flow for `target`: spawns the capture chosen on
     /// the settings page as a task on the shared runtime and sends the
     /// resulting `ScreenSource` (plus its first frame) back over a
-    /// channel. Returns immediately — nothing here blocks the calling
+    /// channel. Returns immediately: nothing here blocks the calling
     /// `ui()` frame.
     ///
     /// Live goes through `screencast::open_best()`, which still falls back
@@ -1808,14 +1832,14 @@ impl App {
     /// to the Screenshot portal and never asks for screen sharing.
     fn start_picking(&mut self, target: Target) {
         let (tx, rx) = std::sync::mpsc::channel();
-        let capture = self.prefs.capture;
+        let method = self.prefs.capture_method;
 
         match crate::runtime::shared() {
             Ok(rt) => {
                 rt.spawn(async move {
-                    let result = match capture {
-                        crate::prefs::Capture::Live => crate::screencast::open_best().await,
-                        crate::prefs::Capture::Still => crate::portal::capture_screen()
+                    let result = match method {
+                        CaptureMethod::Live => crate::screencast::open_best().await,
+                        CaptureMethod::Still => crate::portal::capture_screen()
                             .await
                             .map(|image| (ScreenSource::Still, image)),
                     };
@@ -1835,7 +1859,7 @@ impl App {
     ///
     /// egui's built-in keyboard zoom is turned off (in `main`) and redone
     /// here with the same shortcuts and steps, because its Ctrl+0 resets
-    /// to 1.0 — which would throw away the desktop's text size. Here the
+    /// to 1.0, which would throw away the desktop's text size. Here the
     /// shortcuts act on a multiplier over it, and Ctrl+0 returns to the
     /// desktop's size.
     fn update_zoom(&mut self, ctx: &egui::Context) {
@@ -1886,16 +1910,16 @@ impl App {
         }
     }
 
-    fn row_mut(&mut self, target: Target) -> &mut ColorRowState {
+    fn card_mut(&mut self, target: Target) -> &mut ColorCard {
         match target {
             Target::Fg => &mut self.fg,
             Target::Bg => &mut self.bg,
         }
     }
 
-    /// Header toolbar background (flax's `.toolbar-brand`): `HEADER_HEIGHT`, toolbar
-    /// background, bottom border; `contents` lays out inside it, left to
-    /// right, vertically centered.
+    /// Header toolbar background (flax's `.toolbar-brand`): `HEADER_HEIGHT`,
+    /// toolbar background, bottom border; `contents` lays out inside it,
+    /// left to right, vertically centered.
     fn header_bar<R>(ui: &mut egui::Ui, p: &Palette, contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
         let width = ui.available_width();
         let rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(width, HEADER_HEIGHT));
@@ -1992,13 +2016,13 @@ impl App {
         ui.scope_builder(
             egui::UiBuilder::new().id_salt("settings").max_rect(content).layout(top_down),
             |ui| {
-                let col_w = ((ui.available_width() - COL_GAP) / 2.0).max(0.0);
-                let size = egui::vec2(col_w, ui.available_height());
+                let column_width = ((ui.available_width() - COLUMN_GAP) / 2.0).max(0.0);
+                let size = egui::vec2(column_width, ui.available_height());
                 ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(COL_GAP, COL_GAP);
+                    ui.spacing_mut().item_spacing = egui::vec2(COLUMN_GAP, COLUMN_GAP);
 
                     ui.allocate_ui_with_layout(size, top_down, |ui| {
-                        ui.spacing_mut().item_spacing.y = COL_GAP;
+                        ui.spacing_mut().item_spacing.y = COLUMN_GAP;
 
                         // Appearance.
                         card(ui, p, |ui| {
@@ -2058,22 +2082,22 @@ impl App {
                             body(ui, "colza looks at your screen only while you pick a color.");
                             ui.add_space(4.0);
                             field_label(ui, "Capture method");
-                            let before = self.prefs.capture;
+                            let before = self.prefs.capture_method;
                             if radio_group(
                                 ui,
                                 p,
                                 "Capture method",
-                                &mut self.prefs.capture,
+                                &mut self.prefs.capture_method,
                                 &[
                                     (
-                                        crate::prefs::Capture::Live,
+                                        CaptureMethod::Live,
                                         "Live (screen sharing)",
                                         "Follows videos and animations as they play, without \
                                          the mouse cursor. Your desktop asks once which screen \
                                          to share.",
                                     ),
                                     (
-                                        crate::prefs::Capture::Still,
+                                        CaptureMethod::Still,
                                         "Still image (screenshot)",
                                         "One screenshot per pick: the image stays frozen while \
                                          the loupe is open, and shows the mouse cursor.",
@@ -2081,12 +2105,12 @@ impl App {
                                 ],
                             ) {
                                 changed = true;
-                                if self.prefs.capture == crate::prefs::Capture::Live
-                                    && before != crate::prefs::Capture::Live
+                                if self.prefs.capture_method == CaptureMethod::Live
+                                    && before != CaptureMethod::Live
                                 {
                                     // Choosing live here is a clear "yes"
                                     // to a share declined earlier this run.
-                                    crate::screencast::forget_refusal();
+                                    crate::screencast::forget_declined();
                                 }
                             }
 
@@ -2094,19 +2118,19 @@ impl App {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().interact_size.y = 28.0;
                                 let forget = ui.add_enabled(
-                                    self.has_token,
+                                    self.has_restore_token,
                                     egui::Button::new(
                                         egui::RichText::new("Forget shared screen").size(12.0),
                                     ),
                                 );
                                 if forget.clicked() {
                                     crate::token_store::clear();
-                                    self.has_token = crate::token_store::exists();
+                                    self.has_restore_token = crate::token_store::exists();
                                 }
                             });
                             body(
                                 ui,
-                                if self.has_token {
+                                if self.has_restore_token {
                                     "A shared screen is remembered. Forget it to choose \
                                      another at the next live pick."
                                 } else {
@@ -2143,7 +2167,7 @@ impl App {
     fn navigate(&mut self, ctx: &egui::Context, to: Page, from_keyboard: bool) {
         self.page = to;
         if to == Page::Settings {
-            self.has_token = crate::token_store::exists();
+            self.has_restore_token = crate::token_store::exists();
         }
         if from_keyboard {
             // Deferred to the next frame: the target button belongs to the
@@ -2166,9 +2190,9 @@ impl App {
         icon_button(ui, p, None, 26.0, "Swap foreground & background", paint_swap).clicked()
     }
 
-    /// Left section: method switch and swap button, "Aa" preview + ratio
-    /// or Lc, then the method's criteria as pass/fail tags. Returns true
-    /// when the swap button was activated.
+    /// Summary section: method switch and swap button, "Aa" preview +
+    /// ratio or Lc, then the method's criteria as pass/fail tags. Returns
+    /// true when the swap button was activated.
     fn draw_summary(
         ui: &mut egui::Ui,
         p: &Palette,
@@ -2180,7 +2204,7 @@ impl App {
         // score is computed after the switch has had its say, so a click
         // shows the new method's numbers in that same frame. (A swap is
         // applied by the caller after this frame's layout, like before.)
-        let mut big = String::new();
+        let mut score_text = String::new();
         let mut score = 0.0;
         let mut swap = false;
         ui.horizontal(|ui| {
@@ -2192,7 +2216,7 @@ impl App {
                 method,
                 &[(Method::Wcag2, "WCAG 2.x"), (Method::Apca, "APCA")],
             );
-            (score, big) = match *method {
+            (score, score_text) = match *method {
                 Method::Wcag2 => {
                     let ratio = crate::color::contrast_ratio(fg, bg);
                     (ratio, format!("{}:1", format_ratio(ratio)))
@@ -2228,7 +2252,7 @@ impl App {
                 color32(fg),
             );
             ui.label(
-                egui::RichText::new(big)
+                egui::RichText::new(score_text)
                     .size(32.0)
                     .family(bold())
                     .color(p.text),
@@ -2237,17 +2261,17 @@ impl App {
 
         ui.add_space(4.0);
 
-        for (i, c) in criteria.iter().enumerate() {
+        for (i, criterion) in criteria.iter().enumerate() {
             if i > 0 {
                 ui.add(egui::Separator::default().spacing(2.0));
             }
-            Self::criterion_row(ui, p, score >= c.threshold, c);
+            Self::draw_criterion_row(ui, p, score >= criterion.threshold, criterion);
         }
 
         swap
     }
 
-    fn criterion_row(ui: &mut egui::Ui, p: &Palette, pass: bool, c: &Criterion) {
+    fn draw_criterion_row(ui: &mut egui::Ui, p: &Palette, pass: bool, criterion: &Criterion) {
         ui.horizontal(|ui| {
             ui.spacing_mut().interact_size.y = 22.0;
 
@@ -2256,13 +2280,13 @@ impl App {
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     ui.label(
-                        egui::RichText::new(c.ratio_text)
+                        egui::RichText::new(criterion.threshold_text)
                             .size(11.0)
                             .color(p.text_secondary),
                     );
                 },
             );
-            ui.label(egui::RichText::new(c.label).size(12.0).color(p.text));
+            ui.label(egui::RichText::new(criterion.label).size(12.0).color(p.text));
 
             // Pass/fail is conveyed by text, not just color, and is also
             // exposed to screen readers by `tag`.
@@ -2296,16 +2320,16 @@ impl eframe::App for App {
         let mut pick_target: Option<Target> = None;
         let mut swap_requested = false;
 
-        let (bg_eff, fg_eff) = self.effective();
-        let mut nav: Option<(Page, bool)> = None;
+        let (effective_bg, effective_fg) = self.effective_colors();
+        let mut navigation: Option<(Page, bool)> = None;
 
         if self.page == Page::Settings {
-            // Escape goes back, as it would close a dialog — unless it's
+            // Escape goes back, as it would close a dialog, unless it's
             // closing an open dropdown, which egui handles itself.
             if !egui::Popup::is_any_open(ctx)
                 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
             {
-                nav = Some((Page::Main, true));
+                navigation = Some((Page::Main, true));
             }
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(p.toolbar_bg))
@@ -2313,7 +2337,8 @@ impl eframe::App for App {
                     ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
                     let back = Self::draw_settings_header(ui, &p);
                     if back.clicked() {
-                        nav = Some((Page::Main, !back.clicked_by(egui::PointerButton::Primary)));
+                        navigation =
+                            Some((Page::Main, !back.clicked_by(egui::PointerButton::Primary)));
                     }
                     self.draw_settings(ui, &p);
                 });
@@ -2326,35 +2351,38 @@ impl eframe::App for App {
 
                     let settings = Self::draw_header(ui, &p);
                     if settings.clicked() {
-                        nav = Some((Page::Settings, !settings.clicked_by(egui::PointerButton::Primary)));
+                        navigation = Some((
+                            Page::Settings,
+                            !settings.clicked_by(egui::PointerButton::Primary),
+                        ));
                     }
 
-                    let body_h = ui.available_height();
+                    let body_height = ui.available_height();
                     let top_down = egui::Layout::top_down(egui::Align::Min);
 
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
-                        // Left: contrast section, full height, separated from
+                        // Left: summary section, full height, separated from
                         // the colors by a vertical line (flax's sidebar border).
-                        let (left, _) = ui.allocate_exact_size(
-                            egui::vec2(LEFT_WIDTH, body_h),
+                        let (summary, _) = ui.allocate_exact_size(
+                            egui::vec2(SUMMARY_WIDTH, body_height),
                             egui::Sense::hover(),
                         );
-                        ui.painter().rect_filled(left, 0.0, p.bg);
+                        ui.painter().rect_filled(summary, 0.0, p.bg);
                         ui.painter().vline(
-                            left.right() - 0.5,
-                            left.y_range(),
+                            summary.right() - 0.5,
+                            summary.y_range(),
                             egui::Stroke::new(1.0_f32, p.border),
                         );
                         ui.scope_builder(
                             egui::UiBuilder::new()
                                 .id_salt("summary")
-                                .max_rect(left.shrink(CARD_MARGIN))
+                                .max_rect(summary.shrink(CARD_MARGIN))
                                 .layout(top_down),
                             |ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                                if Self::draw_summary(ui, &p, bg_eff, fg_eff, method) {
+                                if Self::draw_summary(ui, &p, effective_bg, effective_fg, method) {
                                     swap_requested = true;
                                 }
                             },
@@ -2362,13 +2390,13 @@ impl eframe::App for App {
 
                         // Right: the two color cards, each as tall as its
                         // content, with extra room after the vertical line.
-                        let (right, _) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width(), body_h),
+                        let (colors, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), body_height),
                             egui::Sense::hover(),
                         );
                         let content = egui::Rect::from_min_max(
-                            right.min + egui::vec2(RIGHT_PAD_LEFT, CARD_MARGIN),
-                            right.max - egui::vec2(CARD_MARGIN, CARD_MARGIN),
+                            colors.min + egui::vec2(COLORS_PAD_LEFT, CARD_MARGIN),
+                            colors.max - egui::vec2(CARD_MARGIN, CARD_MARGIN),
                         );
                         ui.scope_builder(
                             egui::UiBuilder::new()
@@ -2376,11 +2404,12 @@ impl eframe::App for App {
                                 .max_rect(content)
                                 .layout(top_down),
                             |ui| {
-                                let col_w = ((ui.available_width() - COL_GAP) / 2.0).max(0.0);
-                                let size = egui::vec2(col_w, ui.available_height());
+                                let column_width =
+                                    ((ui.available_width() - COLUMN_GAP) / 2.0).max(0.0);
+                                let size = egui::vec2(column_width, ui.available_height());
 
                                 ui.horizontal_top(|ui| {
-                                    ui.spacing_mut().item_spacing.x = COL_GAP;
+                                    ui.spacing_mut().item_spacing.x = COLUMN_GAP;
 
                                     // Foreground.
                                     ui.allocate_ui_with_layout(size, top_down, |ui| {
@@ -2406,7 +2435,7 @@ impl eframe::App for App {
                 });
         }
 
-        if let Some((to, from_keyboard)) = nav {
+        if let Some((to, from_keyboard)) = navigation {
             self.navigate(ctx, to, from_keyboard);
         }
 
@@ -2429,24 +2458,24 @@ impl eframe::App for App {
                     ctx.request_repaint();
                 }
                 Ok(Err(err)) => {
-                    eprintln!("screen capture failed: {err}");
+                    eprintln!("colza: screen capture failed: {err}");
                     self.mode = Mode::Normal;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     ctx.request_repaint_after(std::time::Duration::from_millis(16));
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    eprintln!("screen capture task ended without a result");
+                    eprintln!("colza: screen capture task ended without a result");
                     self.mode = Mode::Normal;
                 }
             },
 
-            Mode::Magnifying(target, state, capture) => {
+            Mode::Magnifying(target, state, source) => {
                 let target = *target;
                 let mut should_close = false;
                 let mut picked_color = None;
 
-                if let Some(frame) = capture.take_frame() {
+                if let Some(frame) = source.take_frame() {
                     state.accept_frame(frame);
                 }
 
@@ -2489,7 +2518,7 @@ impl eframe::App for App {
                 );
 
                 if let Some(color) = picked_color {
-                    self.row_mut(target).set_color(color);
+                    self.card_mut(target).set_picked_color(color);
                 }
                 if should_close {
                     self.mode = Mode::Normal;
@@ -2514,8 +2543,8 @@ impl eframe::App for App {
 /// there is no global switch for it. So this gives that claim to whatever
 /// is focused, once per frame, after the widgets have drawn (the
 /// filter is read at the start of the next frame). Widgets that use
-/// arrows themselves — sliders, the segmented control, text fields,
-/// dropdowns — still read them; buttons simply ignore them.
+/// arrows themselves (sliders, the segmented control, text fields,
+/// dropdowns) still read them; buttons simply ignore them.
 ///
 /// That includes the options of an open dropdown list: egui's spatial
 /// move would leave the list for whatever lies under it (the eyedropper,
@@ -2575,48 +2604,48 @@ fn setup_fonts(ctx: &egui::Context) {
 /// focus ring from here.
 fn visuals_for(dark: bool) -> egui::Visuals {
     let p = Palette::new(dark);
-    let mut v = if dark {
+    let mut visuals = if dark {
         egui::Visuals::dark()
     } else {
         egui::Visuals::light()
     };
 
-    v.panel_fill = p.toolbar_bg;
-    v.window_fill = p.bg;
-    v.window_stroke = egui::Stroke::new(1.0_f32, p.border);
-    v.window_corner_radius = egui::CornerRadius::same(8);
-    v.extreme_bg_color = p.bg; // text field background
-    v.faint_bg_color = p.toolbar_bg;
-    v.hyperlink_color = p.link;
-    v.selection.bg_fill = p.accent_bg;
+    visuals.panel_fill = p.toolbar_bg;
+    visuals.window_fill = p.bg;
+    visuals.window_stroke = egui::Stroke::new(1.0_f32, p.border);
+    visuals.window_corner_radius = egui::CornerRadius::same(8);
+    visuals.extreme_bg_color = p.bg; // text field background
+    visuals.faint_bg_color = p.toolbar_bg;
+    visuals.hyperlink_color = p.link;
+    visuals.selection.bg_fill = p.accent_bg;
     // Text field focus ring: 2px in flax's focus color.
-    v.selection.stroke = egui::Stroke::new(2.0, p.focus);
+    visuals.selection.stroke = egui::Stroke::new(2.0, p.focus);
 
     // Separators use the noninteractive stroke.
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, p.border);
-    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, p.text);
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, p.border);
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, p.text);
 
-    let r = egui::CornerRadius::same(6);
-    for w in [
-        &mut v.widgets.inactive,
-        &mut v.widgets.hovered,
-        &mut v.widgets.active,
-        &mut v.widgets.open,
+    let radius = egui::CornerRadius::same(6);
+    for widget in [
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
     ] {
-        w.corner_radius = r;
-        w.bg_fill = p.bg;
-        w.weak_bg_fill = p.bg;
-        w.fg_stroke = egui::Stroke::new(1.0_f32, p.text);
+        widget.corner_radius = radius;
+        widget.bg_fill = p.bg;
+        widget.weak_bg_fill = p.bg;
+        widget.fg_stroke = egui::Stroke::new(1.0_f32, p.text);
     }
-    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, p.border);
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, p.text_secondary);
-    v.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, p.text_secondary);
-    v.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, p.text_secondary);
-    v.widgets.hovered.weak_bg_fill = p.toolbar_bg;
-    v.widgets.active.weak_bg_fill = p.toolbar_bg;
-    v.widgets.open.weak_bg_fill = p.toolbar_bg;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, p.border);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, p.text_secondary);
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, p.text_secondary);
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, p.text_secondary);
+    visuals.widgets.hovered.weak_bg_fill = p.toolbar_bg;
+    visuals.widgets.active.weak_bg_fill = p.toolbar_bg;
+    visuals.widgets.open.weak_bg_fill = p.toolbar_bg;
 
-    v
+    visuals
 }
 
 /// Registers both themes; egui picks the one matching the system.
@@ -2681,8 +2710,8 @@ pub fn main() -> anyhow::Result<()> {
             crate::system_theme::apply(&cc.egui_ctx, system_theme);
             crate::system_theme::watch(cc.egui_ctx.clone());
 
-            let (tx, text_scale_rx) = std::sync::mpsc::channel();
-            crate::text_scale::watch(cc.egui_ctx.clone(), tx);
+            let (text_scale_tx, text_scale_rx) = std::sync::mpsc::channel();
+            crate::text_scale::watch(cc.egui_ctx.clone(), text_scale_tx);
 
             let app = App {
                 text_scale,
@@ -2699,6 +2728,7 @@ pub fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2725,41 +2755,41 @@ mod tests {
 
     #[test]
     fn field_text_matches_each_format() {
-        let mut row = ColorRowState::new("Foreground", Rgb::new(0x33, 0x66, 0x99));
+        let mut card = ColorCard::new("Foreground", Rgb::new(0x33, 0x66, 0x99));
         for (format, text) in [
             (ColorFormat::Hex, "#336699"),
             (ColorFormat::Rgb, "rgb(51, 102, 153)"),
             (ColorFormat::Hsl, "hsl(210, 50%, 40%)"),
         ] {
-            row.format = format;
-            row.set_rgb(row.color);
-            assert_eq!(row.text, text);
+            card.format = format;
+            card.set_rgb(card.color);
+            assert_eq!(card.text, text);
         }
     }
 
     /// The reason `components` is stored: a gray's hue must survive.
     #[test]
     fn hsl_hue_survives_desaturating() {
-        let mut row = ColorRowState::new("Foreground", Rgb::new(0x33, 0x66, 0x99));
-        row.format = ColorFormat::Hsl;
-        row.set_rgb(row.color);
-        let [h, _, l] = row.components;
-        row.set_components([h, 0.0, l]);
-        assert_eq!(row.color.r, row.color.b); // gray now
-        row.set_components([h, 50.0, l]);
-        assert_eq!(row.color, Rgb::new(0x33, 0x66, 0x99));
+        let mut card = ColorCard::new("Foreground", Rgb::new(0x33, 0x66, 0x99));
+        card.format = ColorFormat::Hsl;
+        card.set_rgb(card.color);
+        let [h, _, l] = card.components;
+        card.set_components([h, 0.0, l]);
+        assert_eq!(card.color.r, card.color.b); // gray now
+        card.set_components([h, 50.0, l]);
+        assert_eq!(card.color, Rgb::new(0x33, 0x66, 0x99));
     }
 
     #[test]
     fn oklch_out_of_gamut_is_flagged_and_kept() {
-        let mut row = ColorRowState::new("Foreground", Rgb::new(0, 0, 0));
-        row.format = ColorFormat::Oklch;
-        row.set_components([60.0, 0.4, 145.0]);
-        assert!(row.out_of_gamut);
-        row.sync_text();
-        assert_eq!(row.text, "oklch(60% 0.4 145)"); // what was asked for
+        let mut card = ColorCard::new("Foreground", Rgb::new(0, 0, 0));
+        card.format = ColorFormat::Oklch;
+        card.set_components([60.0, 0.4, 145.0]);
+        assert!(card.out_of_gamut);
+        card.sync_text();
+        assert_eq!(card.text, "oklch(60% 0.4 145)"); // what was asked for
         // The color actually used is a real sRGB color.
-        assert!(row.color.to_oklch().c < 0.4);
+        assert!(card.color.to_oklch().c < 0.4);
     }
 
     #[test]
