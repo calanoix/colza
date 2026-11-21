@@ -735,39 +735,164 @@ fn icon_button(
     resp.on_hover_text(label)
 }
 
-/// Up/Down on a *closed*, focused ComboBox step through `all` in place,
-/// like a native <select> (clamped, not wrapped); egui's ComboBox has no
-/// keyboard handling of its own besides opening. Left alone while the
-/// list is open: there egui's arrow navigation between the options is
-/// the right behavior. Returns true if `value` changed.
-fn combo_arrow_keys<T: Copy + PartialEq>(
-    ui: &egui::Ui,
-    combo: &egui::Response,
-    open: bool,
+/// A `ComboBox` over `all`, with the keyboard behavior of a native
+/// `<select>`, which egui's ComboBox only partly has. Returns the
+/// dropdown button's response and whether `value` changed.
+///
+/// - Closed and focused: Up/Down step through `all` in place (clamped, not
+///   wrapped); egui has no keyboard handling here besides opening.
+/// - Opened from the keyboard (Space/Enter): focus moves onto the current
+///   option, so it shows where the user is and arrows go on from there.
+///   egui would leave it on the button, where nothing marks it while the
+///   list covers the page — it reads as lost.
+/// - Open: arrows move between the options only (see [`list_arrow_keys`]).
+/// - Enter/Space on an option picks it and closes the list. egui's
+///   `CloseOnClick` only counts pointer clicks, so it would stay open.
+/// - Once the list closes (pick, Escape, click), focus goes back to the
+///   button, as a native control does. Otherwise it's really lost: Escape
+///   clears egui's focus outright, and a picked option is a widget that
+///   no longer exists. Not done if focus has meanwhile gone elsewhere
+///   (Tab out of the list, a click on another widget).
+fn select_box<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    combo: egui::ComboBox,
     value: &mut T,
     all: &[T],
-) -> bool {
-    if !combo.has_focus() || open {
-        return false;
+    option_text: impl Fn(T) -> egui::RichText,
+) -> (egui::Response, bool) {
+    // The button's id, needed inside the list before the button has been
+    // drawn this frame: remembered from the last one, under a key tied to
+    // this spot in the layout.
+    let button_key = ui.next_auto_id().with("colza-select-button");
+    let button_id: Option<egui::Id> = ui.data(|d| d.get_temp(button_key));
+
+    let mut option_ids = Vec::with_capacity(all.len());
+    let mut changed = false;
+    let inner = combo.show_ui(ui, |ui| {
+        for &v in all {
+            let r = ui.selectable_value(value, v, option_text(v));
+            changed |= r.changed();
+            if r.clicked() && !r.clicked_by(egui::PointerButton::Primary) {
+                ui.close();
+            }
+            option_ids.push(r.id);
+        }
+        let selected = all.iter().position(|v| v == value);
+        list_arrow_keys(ui, &option_ids, button_id, selected);
+    });
+    let open = inner.inner.is_some();
+    let resp = inner.response;
+    ui.data_mut(|d| d.insert_temp(button_key, resp.id));
+
+    if !open && resp.has_focus() {
+        let step: isize = ui.input_mut(|i| {
+            let mut d = 0;
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                d -= 1;
+            }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                d += 1;
+            }
+            d
+        });
+        if step != 0 {
+            let i = all.iter().position(|v| v == value).unwrap_or(0) as isize;
+            let next = all[(i + step).clamp(0, all.len() as isize - 1) as usize];
+            changed |= next != *value;
+            *value = next;
+        }
     }
-    let step: isize = ui.input_mut(|i| {
-        let mut d = 0;
+
+    if open && resp.clicked() && !resp.clicked_by(egui::PointerButton::Primary) {
+        if let Some(i) = all.iter().position(|v| v == value) {
+            ui.memory_mut(|m| m.request_focus(option_ids[i]));
+            ui.ctx().request_repaint();
+        }
+    }
+
+    let key = resp.id.with("colza-select-focus");
+    let focused = ui.memory(|m| m.focused());
+    if open {
+        if let Some(f) = focused.filter(|f| *f == resp.id || option_ids.contains(f)) {
+            ui.data_mut(|d| d.insert_temp(key, Some(f)));
+        }
+    } else if let Some(last) = ui.data_mut(|d| d.remove_temp::<Option<egui::Id>>(key)).flatten() {
+        if focused.is_none() || focused == Some(last) {
+            ui.memory_mut(|m| m.request_focus(resp.id));
+        }
+    }
+
+    (resp, changed)
+}
+
+/// Arrow keys inside an open dropdown list whose options are `option_ids`
+/// (in order), `button` being its dropdown button and `selected` the
+/// index of the current value. Up/Down move focus between the options,
+/// clamped at the ends; Home/End jump to them; from the button, either
+/// arrow lands on the current option. Left/Right do nothing.
+///
+/// Must run inside the list, after its options: egui's own handling of
+/// arrows (its spatial focus move at the end of the frame, which happily
+/// leaves the list for the widgets under it, and since 0.37 its menu
+/// navigation, which runs just after the list's contents) is cancelled
+/// from here with `move_focus(None)` before either acts. Normally
+/// `keep_arrows_off_focus` already keeps egui from seeing the arrows, but
+/// not on the first frame after focus moves to an option: egui only
+/// accepts a focus-lock filter for a widget focused since the last frame.
+fn list_arrow_keys(
+    ui: &egui::Ui,
+    option_ids: &[egui::Id],
+    button: Option<egui::Id>,
+    selected: Option<usize>,
+) {
+    let Some(last) = option_ids.len().checked_sub(1) else {
+        return;
+    };
+    let focused = ui.memory(|m| m.focused());
+    let current = focused.and_then(|f| option_ids.iter().position(|id| *id == f));
+    if current.is_none() && (focused.is_none() || focused != button) {
+        return;
+    }
+    let (step, home, end, sideways) = ui.input_mut(|i| {
+        let mut d = 0isize;
         if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
             d -= 1;
         }
         if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
             d += 1;
         }
-        d
+        (
+            d,
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Home),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::End),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
+                | i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+        )
     });
-    if step == 0 {
-        return false;
+    let target = if home {
+        Some(0)
+    } else if end {
+        Some(last)
+    } else if step != 0 {
+        Some(match current {
+            Some(i) => (i as isize + step).clamp(0, last as isize) as usize,
+            None => selected.unwrap_or(0).min(last),
+        })
+    } else {
+        None
+    };
+    if target.is_none() && !sideways {
+        return;
     }
-    let i = all.iter().position(|v| v == value).unwrap_or(0) as isize;
-    let next = all[(i + step).clamp(0, all.len() as isize - 1) as usize];
-    let changed = next != *value;
-    *value = next;
-    changed
+    ui.memory_mut(|m| {
+        m.move_focus(egui::FocusDirection::None);
+        if let Some(t) = target {
+            m.request_focus(option_ids[t]);
+        }
+    });
+    // An idle frame right away, so the new option has been focused for a
+    // frame (and has its filter) before the next key, held or not, arrives.
+    ui.ctx().request_repaint();
 }
 
 /// Vertical radio group in flax's style (`.radio-group`): a circle, a
@@ -1346,23 +1471,15 @@ impl ColorRowState {
                         .size(12.0)
                         .family(bold())
                         .color(p.text),
-                )
-                .show_ui(ui, |ui| {
-                    for f in ColorFormat::ALL {
-                        ui.selectable_value(
-                            format,
-                            f,
-                            egui::RichText::new(f.name()).size(12.0),
-                        );
-                    }
-                });
+                );
+            let (combo, _) = select_box(ui, combo, format, &ColorFormat::ALL, |f| {
+                egui::RichText::new(f.name()).size(12.0)
+            });
             // No label is drawn next to the dropdown (the card title says
             // whose it is), so it gets its name here; egui would otherwise
             // announce only its value, "HEX".
             let name = format!("{label} color format");
-            a11y(ui, combo.response.id, |node| node.set_label(name));
-
-            combo_arrow_keys(ui, &combo.response, combo.inner.is_some(), format, &ColorFormat::ALL);
+            a11y(ui, combo.id, |node| node.set_label(name));
         });
         if self.format != before {
             // Re-derived from the 8-bit color, so an out-of-gamut OkLCh
@@ -1828,25 +1945,13 @@ impl App {
                             let theme = &mut self.prefs.theme;
                             let combo = egui::ComboBox::from_id_salt("theme")
                                 .width(ui.available_width())
-                                .selected_text(egui::RichText::new(theme.label()).size(13.0).color(p.text))
-                                .show_ui(ui, |ui| {
-                                    for t in crate::prefs::Theme::ALL {
-                                        if ui
-                                            .selectable_value(theme, t, egui::RichText::new(t.label()).size(13.0))
-                                            .changed()
-                                        {
-                                            changed = true;
-                                        }
-                                    }
+                                .selected_text(egui::RichText::new(theme.label()).size(13.0).color(p.text));
+                            let (combo, theme_changed) =
+                                select_box(ui, combo, theme, &crate::prefs::Theme::ALL, |t| {
+                                    egui::RichText::new(t.label()).size(13.0)
                                 });
-                            a11y(ui, combo.response.id, |node| node.set_label("Theme"));
-                            changed |= combo_arrow_keys(
-                                ui,
-                                &combo.response,
-                                combo.inner.is_some(),
-                                theme,
-                                &crate::prefs::Theme::ALL,
-                            );
+                            changed |= theme_changed;
+                            a11y(ui, combo.id, |node| node.set_label("Theme"));
                         });
 
                         // Text size: just the shortcuts. The desktop's own
@@ -2346,14 +2451,12 @@ impl eframe::App for App {
 /// is focused, once per frame, after the widgets have drawn (the
 /// filter is read at the start of the next frame). Widgets that use
 /// arrows themselves — sliders, the segmented control, text fields,
-/// the format dropdown — still read them; buttons simply ignore them.
+/// dropdowns — still read them; buttons simply ignore them.
 ///
-/// Skipped while a popup is open: inside the format dropdown's list,
-/// arrows moving between the options *is* the expected behavior.
+/// That includes the options of an open dropdown list: egui's spatial
+/// move would leave the list for whatever lies under it (the eyedropper,
+/// the sliders), so `select_box` moves between the options itself.
 fn keep_arrows_off_focus(ctx: &egui::Context) {
-    if egui::Popup::is_any_open(ctx) {
-        return;
-    }
     let Some(id) = ctx.memory(|m| m.focused()) else {
         return;
     };
