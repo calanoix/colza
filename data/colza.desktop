@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=colza
+GenericName=Color Contrast Checker
+Comment=Pick colors on screen and check their WCAG and APCA contrast
+Exec=colza gui
+Icon=colza
+Terminal=false
+Categories=Graphics;Utility;
+Keywords=color;contrast;WCAG;APCA;accessibility;picker;eyedropper;
+StartupNotify=true

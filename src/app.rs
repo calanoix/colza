@@ -1,7 +1,7 @@
 //! Main GUI, styled to match the flax extension (same palette, radii,
 //! spacing and type scale as `panel.css`, light and dark):
 //!
-//! - a 36px toolbar-style header (brand name, settings button at the right);
+//! - a 44px toolbar-style header (colza logo, settings button at the right);
 //! - a body split by a 1px vertical line (like flax's sidebar border):
 //!   - left (white, full height): a WCAG 2.x / APCA segmented control
 //!     with a "swap foreground & background" icon button beside it,
@@ -117,8 +117,9 @@ const ICON_HOVER: egui::Color32 = egui::Color32::from_rgba_premultiplied(19, 19,
 
 /// Horizontal gap between the layout columns.
 const COL_GAP: f32 = 12.0;
-/// Height of the header toolbar (flax: 36px).
-const HEADER_HEIGHT: f32 = 36.0;
+/// Height of the header toolbar. flax uses 36px, but the logo needs more
+/// air around it than the plain-text title had.
+const HEADER_HEIGHT: f32 = 44.0;
 /// Height of swatch, text field and icon buttons.
 const CONTROL_SIZE: f32 = 32.0;
 /// Card inner margin (flax: 16px) and border width.
@@ -127,19 +128,23 @@ const CARD_MARGIN: f32 = 16.0;
 /// (flax: the sidebar, separated from the detail pane by a 1px line).
 const LEFT_WIDTH: f32 = 260.0;
 /// Fixed window size (the window is not resizable). The height fits the
-/// tallest section: header (36) + a color card (318) + its 16px margins
+/// tallest section: header (44) + a color card (318) + its 16px margins
 /// above and below. The left section is shorter (~290 of content) since
 /// the swap button moved into its header row.
 /// The width is set by the longest text the color field must show whole:
 /// an OkLCh value like `oklch(56.36% 0.29123 302.15)` measures ~163px in
 /// Roboto 12px, and at 840px wide the field only had 140px of text area.
-const WINDOW_SIZE: [f32; 2] = [896.0, 386.0];
+const WINDOW_SIZE: [f32; 2] = [896.0, 394.0];
 /// Extra vertical space between two sliders (on top of the card's spacing).
 const SLIDER_GAP: f32 = 6.0;
 /// Space between the vertical line and the color cards.
 const RIGHT_PAD_LEFT: f32 = 28.0;
 /// Size of the icon buttons in the header (settings, back).
 const HEADER_BUTTON_SIZE: f32 = 28.0;
+/// Height of the logo in the header. Its wordmark fills the middle ~37%
+/// of the image's height, so at 22pt the letters stand about as tall as
+/// the 12px bold title it replaces.
+const LOGO_HEIGHT: f32 = 22.0;
 /// `repository` from Cargo.toml, empty when unset (then the settings
 /// page shows no link rather than a guessed one).
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
@@ -1037,30 +1042,55 @@ fn keycap(ui: &mut egui::Ui, p: &Palette, key: &str) {
 const GITHUB_MARK: &[u8] = include_bytes!("../assets/github-mark.png");
 const GITHUB_MARK_WHITE: &[u8] = include_bytes!("../assets/github-mark-white.png");
 
-/// The mark for the current theme (black on light, white on dark),
-/// decoded and uploaded once, then cached in egui's memory.
+/// The colza logo (pictogram and wordmark), one PNG per theme, each
+/// rendered from its SVG with `rsvg-convert -h 160 <svg> -o <png>`.
+/// `assets/colza.svg` is the original; neither variant uses it as is:
 ///
-/// Mipmapped because the source is far larger than the ~20pt it's drawn
-/// at: plain linear filtering samples too few source pixels when shrinking
-/// that much, and the edges come out jagged.
-fn github_mark(ctx: &egui::Context, dark: bool) -> Option<egui::TextureHandle> {
-    let id = egui::Id::new(("github-mark", dark));
+/// - `colza-light.svg` → `logo-colza.png`: the four pictogram colors
+///   darkened in OkLCh lightness, hue kept, since the original yellow
+///   (#EFFF2A) is 1.01:1 against the light header (#F1F3F4) — invisible.
+///   Each was lowered to a set contrast, keeping the original yellow →
+///   green progression: #EFFF2A → #CBD908 (1.4:1), #D3F340 → #B7D505
+///   (1.5:1), #B6E656 → #A0CE3A (1.65:1), #9ADA6C → #89C85A (1.8:1).
+/// - `colza-dark.svg` → `logo-colza-dark.png`: the same four colors as
+///   `colza-light.svg`, so the logo looks the same in both themes (7.2:1
+///   and up on the dark header), with the wordmark's black (`.cls-3`)
+///   changed to the dark palette's text color (#E8EAED) so it doesn't
+///   vanish.
+///
+/// PNGs rather than the SVG itself, to render it without adding an SVG
+/// rasterizer to the dependencies. 160px tall covers the 22pt it's drawn
+/// at with zoom up to 3× on a 2× screen (132px) and some margin; the
+/// mipmaps keep it smooth when it's drawn smaller.
+const LOGO: &[u8] = include_bytes!("../assets/logo-colza.png");
+const LOGO_DARK: &[u8] = include_bytes!("../assets/logo-colza-dark.png");
+
+/// An embedded PNG, decoded and uploaded once, then cached in egui's
+/// memory under `name`. `None` (logged) only if the asset is replaced by a
+/// broken file, so callers can fall back to something drawn.
+///
+/// Mipmapped because the sources are far larger than they're drawn: plain
+/// linear filtering samples too few source pixels when shrinking that
+/// much, and the edges come out jagged.
+fn embedded_texture(
+    ctx: &egui::Context,
+    name: &'static str,
+    bytes: &'static [u8],
+) -> Option<egui::TextureHandle> {
+    let id = egui::Id::new(("embedded-texture", name));
     if let Some(tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
         return Some(tex);
     }
-    let bytes = if dark { GITHUB_MARK_WHITE } else { GITHUB_MARK };
     let img = match image::load_from_memory(bytes) {
         Ok(img) => img.to_rgba8(),
         Err(err) => {
-            // Only reachable if the asset is replaced by a broken file;
-            // the header then just shows no link.
-            eprintln!("colza: could not decode the GitHub mark: {err}");
+            eprintln!("colza: could not decode {name}: {err}");
             return None;
         }
     };
     let size = [img.width() as usize, img.height() as usize];
     let tex = ctx.load_texture(
-        "github-mark",
+        name,
         egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()),
         egui::TextureOptions {
             mipmap_mode: Some(egui::TextureFilter::Linear),
@@ -1069,6 +1099,46 @@ fn github_mark(ctx: &egui::Context, dark: bool) -> Option<egui::TextureHandle> {
     );
     ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
     Some(tex)
+}
+
+/// The GitHub mark for the current theme (black on light, white on dark).
+fn github_mark(ctx: &egui::Context, dark: bool) -> Option<egui::TextureHandle> {
+    if dark {
+        embedded_texture(ctx, "github-mark-white", GITHUB_MARK_WHITE)
+    } else {
+        embedded_texture(ctx, "github-mark", GITHUB_MARK)
+    }
+}
+
+/// The window's title: the colza logo for the current theme, exposed to
+/// assistive tech as the level-1 heading "colza" — its text alternative,
+/// and the same heading the plain-text title used to give. Falls back to
+/// that text title if the image can't be decoded.
+fn logo(ui: &mut egui::Ui, p: &Palette) {
+    const NAME: &str = "colza";
+    let tex = if ui.visuals().dark_mode {
+        embedded_texture(ui.ctx(), "logo-colza-dark", LOGO_DARK)
+    } else {
+        embedded_texture(ui.ctx(), "logo-colza", LOGO)
+    };
+    let Some(tex) = tex else {
+        let title = ui.label(egui::RichText::new(NAME).size(12.0).family(bold()).color(p.text));
+        mark_heading(ui, title.id, 1, NAME);
+        return;
+    };
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(LOGO_HEIGHT * tex.aspect_ratio(), LOGO_HEIGHT),
+        egui::Sense::hover(),
+    );
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Image, true, NAME));
+    // After `widget_info`, which would otherwise reset the role to image.
+    mark_heading(ui, resp.id, 1, NAME);
+    ui.painter().image(
+        tex.id(),
+        rect,
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
 }
 
 /// GitHub mark linking to `url`, like flax's header. A link for
@@ -1823,7 +1893,7 @@ impl App {
         }
     }
 
-    /// Header toolbar background (flax's `.toolbar-brand`): 36px, toolbar
+    /// Header toolbar background (flax's `.toolbar-brand`): `HEADER_HEIGHT`, toolbar
     /// background, bottom border; `contents` lays out inside it, left to
     /// right, vertically centered.
     fn header_bar<R>(ui: &mut egui::Ui, p: &Palette, contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -1843,18 +1913,12 @@ impl App {
         .inner
     }
 
-    /// Main page header: brand name on the left, settings button on the
+    /// Main page header: logo on the left, settings button on the
     /// right. Returns the settings button's response.
     fn draw_header(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
         Self::header_bar(ui, p, |ui| {
             ui.add_space(16.0);
-            let title = ui.label(
-                egui::RichText::new("colza")
-                    .size(12.0)
-                    .family(bold())
-                    .color(p.text),
-            );
-            mark_heading(ui, title.id, 1, "colza");
+            logo(ui, p);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
                 icon_button(
@@ -2561,6 +2625,22 @@ fn setup_style(ctx: &egui::Context) {
     ctx.set_visuals_of(egui::Theme::Dark, visuals_for(true));
 }
 
+/// Window icon: the logo's pictogram alone (`assets/colza-icon.svg`, the
+/// light/dark logos' colors without the wordmark), rendered with
+/// `rsvg-convert -w 256 -h 256 colza-icon.svg -o icon-colza-256.png`.
+///
+/// Only used where the window itself carries its icon (X11, XWayland).
+/// On Wayland, winit 0.30 drops it (`set_window_icon` is a no-op there):
+/// KDE and GNOME take the icon from the `.desktop` file whose name
+/// matches the window's app id, hence `APP_ID` and `data/colza.desktop`.
+const WINDOW_ICON: &[u8] = include_bytes!("../assets/icon-colza-256.png");
+
+/// The Wayland app id, which the desktop matches to `colza.desktop` (and
+/// through it, `Icon=colza`). eframe would default to the app name, which
+/// is the same today; set here so renaming the window title can't break
+/// the match. Also names the folder eframe would persist state to.
+const APP_ID: &str = "colza";
+
 pub fn main() -> anyhow::Result<()> {
     // Read before the window exists, so it opens at its final size. eframe
     // creates the window before the app (with a zoom of 1), hence the size
@@ -2568,12 +2648,21 @@ pub fn main() -> anyhow::Result<()> {
     let text_scale = crate::text_scale::read_blocking();
     let prefs = crate::prefs::Prefs::load();
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_app_id(APP_ID)
+        .with_inner_size([WINDOW_SIZE[0] * text_scale, WINDOW_SIZE[1] * text_scale])
+        .with_resizable(false)
+        .with_maximize_button(false);
+    match eframe::icon_data::from_png_bytes(WINDOW_ICON) {
+        Ok(icon) => viewport = viewport.with_icon(icon),
+        // Only if the asset is replaced by a broken file: the window then
+        // just gets the desktop's generic icon.
+        Err(err) => eprintln!("colza: could not decode the window icon: {err}"),
+    }
+
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([WINDOW_SIZE[0] * text_scale, WINDOW_SIZE[1] * text_scale])
-            .with_resizable(false)
-            .with_maximize_button(false),
+        viewport,
         ..Default::default()
     };
 
