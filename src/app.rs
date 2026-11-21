@@ -2771,14 +2771,14 @@ fn setup_style(ctx: &egui::Context) {
 /// Only used where the window itself carries its icon (X11, XWayland).
 /// On Wayland, winit 0.30 drops it (`set_window_icon` is a no-op there):
 /// KDE and GNOME take the icon from the `.desktop` file whose name
-/// matches the window's app id, hence `APP_ID` and `data/colza.desktop`.
+/// matches the window's app id, hence `APP_ID` and `data/io.github.calanoix.colza.desktop`.
 const WINDOW_ICON: &[u8] = include_bytes!("../assets/icon-colza-256.png");
 
-/// The Wayland app id, which the desktop matches to `colza.desktop` (and
-/// through it, `Icon=colza`). eframe would default to the app name, which
+/// The Wayland app id, which the desktop matches to `io.github.calanoix.colza.desktop` (and
+/// through it, `Icon=io.github.calanoix.colza`). eframe would default to the app name, which
 /// is the same today; set here so renaming the window title can't break
 /// the match. Also names the folder eframe would persist state to.
-pub(crate) const APP_ID: &str = "colza";
+pub(crate) const APP_ID: &str = "io.github.calanoix.colza";
 
 pub fn main() -> anyhow::Result<()> {
     // Read before the window exists, so it opens at its final size. eframe
