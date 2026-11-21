@@ -1,0 +1,74 @@
+# Flatpak manifest for colza.
+#
+# Build from the repository root (not from flatpak/):
+#   flatpak-builder --user --install --install-deps-from=flathub \
+#     --force-clean --repo=flatpak-repo build-dir flatpak/io.github.calanoix.colza.yml
+#
+# The build runs WITHOUT network access (Flathub requires it), so every
+# crate comes from cargo-sources.json, generated from Cargo.lock by
+# flatpak-cargo-generator.py. Regenerate it whenever Cargo.lock changes,
+# or the build fails with "no matching package named ...".
+
+id: io.github.calanoix.colza
+runtime: org.freedesktop.Platform
+runtime-version: '26.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  # libclang for bindgen: libspa-sys / pipewire-sys (pulled in by ashpd's
+  # pipewire feature) generate their bindings at build time, and the base
+  # SDK ships no libclang. Build-time only, nothing lands in the app.
+  - org.freedesktop.Sdk.Extension.llvm22
+command: colza
+
+finish-args:
+  # Wayland only, on purpose: the global cursor tracking relies on a
+  # fullscreen window receiving native wl_pointer events, which has no
+  # X11 equivalent here.
+  - --socket=wayland
+  # GPU access for wgpu (Vulkan, or GL fallback).
+  - --device=dri
+  # Nothing else is needed: ScreenCast and Settings go through
+  # xdg-desktop-portal, which every Flatpak can reach, and the PipeWire
+  # stream arrives as a file descriptor handed over by the portal
+  # (OpenPipeWireRemote), so no PipeWire socket permission either.
+  # prefs and the restore token land in ~/.var/app/<id>/config/colza/
+  # because Flatpak sets XDG_CONFIG_HOME there.
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm22/bin
+  prepend-ld-library-path: /usr/lib/sdk/llvm22/lib
+  env:
+    LIBCLANG_PATH: /usr/lib/sdk/llvm22/lib
+    # cargo-sources.json unpacks the vendored crates and a config.toml
+    # pointing at them into this directory.
+    CARGO_HOME: /run/build/colza/cargo
+    CARGO_NET_OFFLINE: 'true'
+
+modules:
+  - name: colza
+    buildsystem: simple
+    build-commands:
+      - cargo --offline build --release --locked
+      - install -Dm755 target/release/colza /app/bin/colza
+      - install -Dm644 flatpak/io.github.calanoix.colza.desktop
+          /app/share/applications/io.github.calanoix.colza.desktop
+      - install -Dm644 flatpak/io.github.calanoix.colza.metainfo.xml
+          /app/share/metainfo/io.github.calanoix.colza.metainfo.xml
+      - install -Dm644 flatpak/io.github.calanoix.colza.svg
+          /app/share/icons/hicolor/scalable/apps/io.github.calanoix.colza.svg
+    sources:
+      # The working tree as-is, uncommitted changes included, which is
+      # what you want while testing. (A `type: git` source would only see
+      # commits.) Skip build outputs: target/ alone can weigh gigabytes,
+      # and copying flatpak-builder's own state dirs into the build would
+      # recurse.
+      - type: dir
+        path: ..
+        skip:
+          - target
+          - build-dir
+          - flatpak-repo
+          - .flatpak-builder
+          - .git
+      - cargo-sources.json

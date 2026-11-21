@@ -1,1 +1,6 @@
 /target
+build-dir/
+flatpak-repo/
+.flatpak-builder/
+*.flatpak
+.claude

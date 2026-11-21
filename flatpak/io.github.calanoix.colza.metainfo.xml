@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Required by Flathub, optional for local testing.
+     TODO before publishing: project_license, homepage URL, screenshots. -->
+<component type="desktop-application">
+  <id>io.github.calanoix.colza</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>colza</name>
+  <summary>Pick colors on screen and check WCAG contrast</summary>
+  <summary xml:lang="fr">Prélever des couleurs à l'écran et vérifier le contraste WCAG</summary>
+
+  <description>
+    <p>
+      colza picks colors anywhere on screen with a pixel-level magnifier,
+      compares two colors and checks them against the WCAG contrast
+      requirements.
+    </p>
+    <ul>
+      <li>Magnifier showing the pixels around the cursor</li>
+      <li>Pixel-precise cursor movement with the arrow keys</li>
+      <li>WCAG AA and AAA results for text and non-text contrast</li>
+      <li>Follows the desktop's light/dark preference and text size</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.github.calanoix.colza.desktop</launchable>
+
+  <developer id="io.github.calanoix">
+    <name>Charles</name>
+  </developer>
+
+  <url type="homepage">https://github.com/calanoix/colza</url>
+  <url type="bugtracker">https://github.com/calanoix/colza/issues</url>
+
+  <content_rating type="oars-1.1"/>
+
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+
+  <releases>
+    <release version="0.1.0" date="2026-11-21"/>
+  </releases>
+</component>
