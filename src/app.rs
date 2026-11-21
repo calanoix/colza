@@ -20,8 +20,8 @@
 //! Picking a color opens the magnifier as a second egui viewport so the
 //! main window stays visible while the loupe is up.
 //!
-//! The theme follows the system (light/dark) unless set otherwise in the
-//! settings.
+//! The theme follows the system (light/dark, read by `system_theme.rs`)
+//! unless set otherwise in the settings.
 //! The window has a fixed size in points (`WINDOW_SIZE`), scaled as a
 //! whole by the zoom: the desktop's text size (`text_scale.rs`) times the
 //! user's own Ctrl+/Ctrl- zoom. The window is resized to match whenever
@@ -2646,6 +2646,9 @@ pub fn main() -> anyhow::Result<()> {
     // creates the window before the app (with a zoom of 1), hence the size
     // scaled by hand here and the zoom set in the creator below.
     let text_scale = crate::text_scale::read_blocking();
+    // Also before the window: egui can't learn it from winit on Wayland
+    // (see `system_theme.rs`), and the first frame should be right.
+    let system_theme = crate::system_theme::read_blocking();
     let prefs = crate::prefs::Prefs::load();
 
     let mut viewport = egui::ViewportBuilder::default()
@@ -2675,6 +2678,8 @@ pub fn main() -> anyhow::Result<()> {
             // Replaced by `App::update_zoom` (see there for why).
             cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
             cc.egui_ctx.set_zoom_factor(text_scale);
+            crate::system_theme::apply(&cc.egui_ctx, system_theme);
+            crate::system_theme::watch(cc.egui_ctx.clone());
 
             let (tx, text_scale_rx) = std::sync::mpsc::channel();
             crate::text_scale::watch(cc.egui_ctx.clone(), tx);

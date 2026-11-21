@@ -5,6 +5,7 @@ mod portal;
 mod prefs;
 mod runtime;
 mod screencast;
+mod system_theme;
 mod text_scale;
 mod token_store;
 
