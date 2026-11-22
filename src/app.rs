@@ -168,6 +168,15 @@ fn back_button_id() -> egui::Id {
     egui::Id::new("colza-back-button")
 }
 
+/// Version shown on the settings page. The suffix marks test builds, so
+/// the one running in a VM can be told apart from the last; bump it with
+/// each one, and drop it (back to the plain Cargo version) for a release.
+const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"), "-test.7");
+
+/// Repaint interval while the magnifier is open (about 60 fps). Needed
+/// because vsync is off (see `main`), so nothing else paces the redraws.
+const MAGNIFIER_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
+
 /// Stable id for the magnifier's viewport, so the same native window can be
 /// referred to across frames (opened once, updated, then closed).
 fn magnifier_viewport_id() -> egui::ViewportId {
@@ -198,8 +207,18 @@ enum Mode {
     /// capture happens off the UI thread.
     Capturing(
         Target,
-        std::sync::mpsc::Receiver<anyhow::Result<(ScreenSource, RgbImage)>>,
+        std::sync::mpsc::Receiver<anyhow::Result<Option<(ScreenSource, RgbImage)>>>,
     ),
+    /// Screen sharing was just declined for `Target`: the pick goes on
+    /// with a screenshot, but only once the main window has focus back
+    /// (see `screencast::open_best` for why). `since` is when the wait
+    /// began; `saw_unfocused` whether the window has been seen without
+    /// focus since then.
+    AwaitingFocus {
+        target: Target,
+        since: std::time::Instant,
+        saw_unfocused: bool,
+    },
     /// First frame in hand; the magnifier viewport is open and sampling
     /// `state` for `Target`.
     ///
@@ -1964,7 +1983,7 @@ impl App {
                     ui.add_space(8.0);
                 }
                 ui.label(
-                    egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                    egui::RichText::new(VERSION_LABEL)
                         .size(12.0)
                         .family(bold())
                         .color(p.text),
@@ -2554,9 +2573,25 @@ impl eframe::App for App {
             Mode::Normal => {}
 
             Mode::Capturing(target, rx) => match rx.try_recv() {
-                Ok(Ok((source, first_frame))) => {
+                Ok(Ok(None)) => {
+                    refresh_permissions = true;
+                    self.mode = Mode::AwaitingFocus {
+                        target: *target,
+                        since: std::time::Instant::now(),
+                        saw_unfocused: false,
+                    };
+                    ctx.request_repaint();
+                }
+                Ok(Ok(Some((source, first_frame)))) => {
                     refresh_permissions = true;
                     let mut state = MagnifierState::new(first_frame);
+                    state.cursor_in_image = !source.is_live();
+                    state.opaque_backdrop = crate::magnifier::needs_opaque_backdrop();
+                    // With an opaque backdrop, later frames would only film
+                    // colza's own overlay (see `needs_opaque_backdrop`):
+                    // the first one is kept, and dropping the live source
+                    // here stops the stream and closes the share.
+                    let source = if state.opaque_backdrop { ScreenSource::Still } else { source };
                     state.live = source.is_live();
                     self.mode = Mode::Magnifying(*target, Box::new(state), source);
                     ctx.request_repaint();
@@ -2574,6 +2609,39 @@ impl eframe::App for App {
                     self.mode = Mode::Normal;
                 }
             },
+
+            Mode::AwaitingFocus { target, since, saw_unfocused } => {
+                // Up to how long a window that never visibly lost focus
+                // is given anyway: the share dialog may not have taken
+                // keyboard focus, or its loss may have come and gone
+                // before this mode began. Long enough for GNOME Shell to
+                // hand focus back.
+                const SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+                // Past this, the user has moved on (to another window,
+                // say): the pick is dropped rather than asking out of
+                // nowhere later.
+                const GIVE_UP: std::time::Duration = std::time::Duration::from_secs(10);
+
+                let focused = ctx.input(|i| i.viewport().focused);
+                if focused == Some(false) {
+                    *saw_unfocused = true;
+                }
+                let elapsed = since.elapsed();
+                if focused == Some(true) && (*saw_unfocused || elapsed >= SETTLE) {
+                    let target = *target;
+                    // `was_declined()` is set now, so this goes straight
+                    // to the screenshot.
+                    self.start_picking(target);
+                } else if elapsed >= GIVE_UP {
+                    eprintln!(
+                        "colza: gave up waiting for focus to come back after screen \
+                         sharing was declined; pick again to use a screenshot"
+                    );
+                    self.mode = Mode::Normal;
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                }
+            }
 
             Mode::Magnifying(target, state, source) => {
                 let target = *target;
@@ -2617,7 +2685,7 @@ impl eframe::App for App {
                         } else if ctx.input(|i| i.viewport().close_requested()) {
                             should_close = true;
                         } else {
-                            ctx.request_repaint();
+                            ctx.request_repaint_after(MAGNIFIER_FRAME);
                         }
                     },
                 );
@@ -2631,8 +2699,10 @@ impl eframe::App for App {
                         magnifier_viewport_id(),
                         egui::ViewportCommand::Close,
                     );
+                    ctx.request_repaint();
+                } else {
+                    ctx.request_repaint_after(MAGNIFIER_FRAME);
                 }
-                ctx.request_repaint();
             }
         }
 
@@ -2771,14 +2841,14 @@ fn setup_style(ctx: &egui::Context) {
 /// Only used where the window itself carries its icon (X11, XWayland).
 /// On Wayland, winit 0.30 drops it (`set_window_icon` is a no-op there):
 /// KDE and GNOME take the icon from the `.desktop` file whose name
-/// matches the window's app id, hence `APP_ID` and `data/io.github.calanoix.colza.desktop`.
+/// matches the window's app id, hence `APP_ID` and `data/colza.desktop`.
 const WINDOW_ICON: &[u8] = include_bytes!("../assets/icon-colza-256.png");
 
-/// The Wayland app id, which the desktop matches to `io.github.calanoix.colza.desktop` (and
-/// through it, `Icon=io.github.calanoix.colza`). eframe would default to the app name, which
+/// The Wayland app id, which the desktop matches to `colza.desktop` (and
+/// through it, `Icon=colza`). eframe would default to the app name, which
 /// is the same today; set here so renaming the window title can't break
 /// the match. Also names the folder eframe would persist state to.
-pub(crate) const APP_ID: &str = "io.github.calanoix.colza";
+pub(crate) const APP_ID: &str = "colza";
 
 pub fn main() -> anyhow::Result<()> {
     // Read before the window exists, so it opens at its final size. eframe
@@ -2794,7 +2864,21 @@ pub fn main() -> anyhow::Result<()> {
         .with_app_id(APP_ID)
         .with_inner_size([WINDOW_SIZE[0] * text_scale, WINDOW_SIZE[1] * text_scale])
         .with_resizable(false)
-        .with_maximize_button(false);
+        .with_maximize_button(false)
+        // Not for the main window itself, which paints every pixel opaque
+        // anyway: this is what lets the *magnifier* be transparent. With
+        // the Glow renderer, eframe picks one GL config for the whole app,
+        // at startup, asking for an alpha channel only if the root
+        // viewport is transparent. Every later viewport, the magnifier
+        // included, then gets that config. Without alpha in it, the
+        // magnifier's transparent background comes out opaque black: the
+        // screen vanishes behind the loupe. Whether a config without the
+        // request still had alpha was down to the driver's config order:
+        // it did on KDE hosts, not on Ubuntu 26.10 (Mesa, virgl), where
+        // the screen went black once the capture came in. (eframe does
+        // log "Cannot create transparent window", but only through `log`,
+        // which colza doesn't print.)
+        .with_transparent(true);
     match eframe::icon_data::from_png_bytes(WINDOW_ICON) {
         Ok(icon) => viewport = viewport.with_icon(icon),
         // Only if the asset is replaced by a broken file: the window then
@@ -2805,6 +2889,25 @@ pub fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport,
+        // Off, or GNOME freezes colza as soon as the magnifier opens.
+        //
+        // With vsync, each window's buffer swap waits for the compositor's
+        // "frame done" for that window. The magnifier is fullscreen, so it
+        // hides the main window completely, and mutter sends no frame
+        // callbacks to a window nobody can see. Both windows are drawn
+        // from this one thread, so the main window's swap then blocked it
+        // for good: the magnifier stayed black, the pointer stopped
+        // responding, and GNOME offered to force-quit colza ("not
+        // responding"). KWin keeps sending them, which is why KDE was
+        // fine.
+        //
+        // The frame rate is capped by hand instead (`MAGNIFIER_FRAME`):
+        // without vsync, a viewport repainting as fast as it can would
+        // spin a CPU core.
+        glow_options: eframe::egui_glow::GlowConfiguration {
+            vsync: false,
+            ..Default::default()
+        },
         ..Default::default()
     };
 

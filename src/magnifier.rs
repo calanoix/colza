@@ -67,10 +67,55 @@ pub struct MagnifierState {
     scale: Option<egui::Vec2>,
     pub cursor_pos: egui::Pos2,
     /// Whether `image` is being refreshed. `false` draws a small caption
-    /// under the loupe, since the degraded path differs in two ways that
-    /// would otherwise look like a bug: the image never updates, and the
-    /// mouse cursor is baked into it.
+    /// under the loupe, since a frozen image would otherwise look like a
+    /// bug.
     pub live: bool,
+    /// Whether the mouse cursor is baked into `image` (a screenshot), which
+    /// the caption then says too.
+    pub cursor_in_image: bool,
+    /// Paint `image` itself as the overlay's background, instead of leaving
+    /// it transparent over the real screen. See [`needs_opaque_backdrop`].
+    pub opaque_backdrop: bool,
+    /// `image` uploaded for [`Self::opaque_backdrop`], made on first use.
+    backdrop_texture: Option<egui::TextureHandle>,
+}
+
+/// Whether the magnifier must paint the captured image as its own
+/// background, because a transparent fullscreen window wouldn't show the
+/// screen under it on this desktop.
+///
+/// Transparency works only where the compositor keeps drawing the other
+/// windows under a fullscreen one, and that turned out to be the
+/// exception. Seen so far:
+///
+/// - KWin (KDE): works, the magnifier stays transparent and live.
+/// - Mutter (GNOME, and the desktops built on it): paints black behind
+///   every fullscreen Wayland window that no opaque surface covers, on
+///   purpose and with no way out for clients (since 43.1,
+///   `maybe_configure_black_background` in `meta-window-actor-wayland.c`).
+/// - Sway (1.9, tested): hides the workspace's other windows behind a
+///   fullscreen one and shows black instead, as tiling compositors do.
+///   Hyprland and COSMIC's tiling are expected to behave alike.
+///
+/// With a black backdrop, a live screen share also films that black and
+/// feeds it back into the loupe. So everywhere but KDE, the overlay
+/// paints the captured image itself, which looks the same. It can't stay
+/// live: the share would film colza's own painting rather than the screen
+/// under it, so the first frame (captured before the overlay appeared,
+/// without the cursor) is kept and the share closed. Unknown desktops get
+/// this too: a frozen image beats a black screen with wrong colors.
+///
+/// Decided by `XDG_CURRENT_DESKTOP` containing "KDE".
+/// `COLZA_OPAQUE_MAGNIFIER=1` or `=0` forces it either way, to test a
+/// desktop not on the list yet.
+pub fn needs_opaque_backdrop() -> bool {
+    if let Some(forced) = std::env::var_os("COLZA_OPAQUE_MAGNIFIER") {
+        return forced != "0";
+    }
+    let is_kde = std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|desktops| {
+        desktops.split(':').any(|d| d.eq_ignore_ascii_case("KDE"))
+    });
+    !is_kde
 }
 
 impl MagnifierState {
@@ -79,6 +124,9 @@ impl MagnifierState {
             image,
             cursor_pos: egui::Pos2::ZERO,
             live: true,
+            cursor_in_image: false,
+            opaque_backdrop: false,
+            backdrop_texture: None,
             overlay_history: VecDeque::new(),
             scale: None,
         }
@@ -271,6 +319,26 @@ impl MagnifierState {
         let screen_rect = ctx.input(|i| i.viewport_rect());
         self.scale = Some(image_scale(self.image.dimensions(), screen_rect.size()));
 
+        if self.opaque_backdrop {
+            let image = &self.image;
+            let texture = self.backdrop_texture.get_or_insert_with(|| {
+                let size = [image.width() as usize, image.height() as usize];
+                // Nearest: the image is the screen at its own resolution,
+                // drawn 1:1, and must not be smoothed.
+                ctx.load_texture(
+                    "magnifier-backdrop",
+                    egui::ColorImage::from_rgb(size, image.as_raw()),
+                    egui::TextureOptions::NEAREST,
+                )
+            });
+            painter.image(
+                texture.id(),
+                screen_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+
         let cursor = self.cursor_pos;
         let half = (LOUPE_GRID / 2) as i64;
 
@@ -386,7 +454,11 @@ impl MagnifierState {
             // the screen: this sits on top of arbitrary desktop content,
             // and plain text over an unknown background is a coin flip for
             // legibility.
-            let caption = "still image · cursor shown";
+            let caption = if self.cursor_in_image {
+                "still image · cursor shown"
+            } else {
+                "still image"
+            };
             let caption_rect = egui::Rect::from_min_size(
                 egui::pos2(loupe_origin.x, band_rect.max.y + 2.0),
                 egui::vec2(LOUPE_SIZE, STILL_CAPTION_HEIGHT),

@@ -86,6 +86,9 @@ struct StreamDiagnostics {
     planes_unmapped: AtomicU32,
     /// Buffers that made it all the way to an `RgbImage`.
     frames_decoded: AtomicU32,
+    /// Buffers skipped because they carried no frame (empty or
+    /// corrupted chunk), as mutter sends between real frames.
+    empty_buffers: AtomicU32,
 }
 
 /// Remembers, for this process only, that the user declined the
@@ -218,15 +221,26 @@ impl ScreenSource {
 ///    user already declined once this run.
 /// 2. `Screenshot`: a still frame, cursor included.
 ///
+/// `Ok(None)` means the share was *just* declined: the caller must call
+/// again (which then goes straight to 2), but only once colza's window
+/// has focus back. Chaining the screenshot request right here failed on
+/// GNOME: the Screenshot portal's first-use question is a system dialog
+/// that GNOME Shell only shows for the focused app, and when the share
+/// dialog's answer arrives, focus hasn't returned to colza yet. The
+/// portal then answers "no" without asking (its log: "Only the focused
+/// app is allowed to show a system access dialog").
+///
 /// Only an explicit refusal triggers the fallback; every other failure
 /// propagates. Silently degrading on a technical error would throw away
 /// the diagnostics `Capture::no_frame_error` produces, turning something
 /// like "DMA-BUF is unsupported on this compositor" into the much
 /// harder-to-chase "the magnifier is mysteriously never live".
-pub async fn open_best() -> anyhow::Result<(ScreenSource, RgbImage)> {
+pub async fn open_best() -> anyhow::Result<Option<(ScreenSource, RgbImage)>> {
     if !SCREENCAST_DECLINED.load(Ordering::Relaxed) {
         match Capture::open().await {
-            Ok((capture, first_frame)) => return Ok((ScreenSource::Live(capture), first_frame)),
+            Ok((capture, first_frame)) => {
+                return Ok(Some((ScreenSource::Live(capture), first_frame)))
+            }
             Err(err) if is_declined(&err) => {
                 SCREENCAST_DECLINED.store(true, Ordering::Relaxed);
                 eprintln!(
@@ -235,13 +249,14 @@ pub async fn open_best() -> anyhow::Result<(ScreenSource, RgbImage)> {
                      will appear in the captured image. Reset screen sharing under \
                      Settings → Permissions (or restart colza) to be asked again."
                 );
+                return Ok(None);
             }
             Err(err) => return Err(err),
         }
     }
 
     let image = crate::portal::capture_screen().await?;
-    Ok((ScreenSource::Still, image))
+    Ok(Some((ScreenSource::Still, image)))
 }
 
 /// Whether this error is the user saying no, as opposed to something
@@ -393,6 +408,7 @@ impl Capture {
         let dequeued = diagnostics.buffers_dequeued.load(Ordering::Relaxed);
         let unmapped = diagnostics.planes_unmapped.load(Ordering::Relaxed);
         let decoded = diagnostics.frames_decoded.load(Ordering::Relaxed);
+        let empty = diagnostics.empty_buffers.load(Ordering::Relaxed);
         let negotiated = diagnostics.format_negotiated.load(Ordering::Relaxed);
         let secs = FIRST_FRAME_TIMEOUT.as_secs();
 
@@ -408,6 +424,11 @@ impl Capture {
                 "no frame after {secs}s and the video format was never negotiated: the PipeWire \
                  stream likely never reached the compositor's node (check that the screen-share \
                  permission wasn't revoked mid-session)"
+            )
+        } else if dequeued > 0 && empty == dequeued {
+            anyhow::anyhow!(
+                "no frame after {secs}s: all {dequeued} buffer(s) the compositor sent were \
+                 empty or marked corrupted, so there was nothing to show yet"
             )
         } else if dequeued == 0 {
             anyhow::anyhow!(
@@ -592,17 +613,43 @@ fn run_stream(
             // `stride` can exceed `width * bytes_per_pixel` (rows padded
             // for alignment), which is why the conversion walks row by row
             // using this rather than assuming a tightly packed buffer.
-            let stride = plane.chunk().stride() as usize;
+            let chunk = plane.chunk();
+            let stride = chunk.stride();
+            let (offset, size) = (chunk.offset() as usize, chunk.size() as usize);
+
+            // A buffer can arrive with no frame in it. Mutter does this
+            // (seen on GNOME): it sends buffers whose chunk is empty
+            // (size 0) when only metadata changed, and marks half-written
+            // ones CORRUPTED. Their memory still holds whatever the pool
+            // last had, often zeros, so decoding them anyway is what
+            // turned the loupe black right after the share was accepted.
+            // Skipping them keeps the last good frame on screen. KWin
+            // never sends these, which is why KDE was unaffected.
+            if size == 0
+                || chunk
+                    .flags()
+                    .contains(pipewire::spa::buffer::ChunkFlags::CORRUPTED)
+            {
+                diagnostics_for_process
+                    .empty_buffers
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
 
             // `None` here is the DMA-BUF case: the buffer holds a GPU
             // handle rather than mappable memory. Counted rather than just
             // skipped, since it's the one failure mode that means
             // "unsupported" instead of "try again", and `no_frame_error`
             // reports it as such.
-            let Some(chunk_data) = plane.data() else {
+            let Some(data) = plane.data() else {
                 diagnostics_for_process
                     .planes_unmapped
                     .fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            // The frame is the chunk's slice of the mapping, not the whole
+            // mapping: `offset` is where it starts.
+            let Some(chunk_data) = data.get(offset..offset.saturating_add(size)) else {
                 return;
             };
 
@@ -616,6 +663,13 @@ fn run_stream(
                 return;
             }
 
+            // A stride of 0 means "tightly packed" (it's optional in SPA).
+            let stride = if stride > 0 {
+                stride as usize
+            } else {
+                let bytes_per_pixel = if info.format() == spa::param::video::VideoFormat::RGB { 3 } else { 4 };
+                width as usize * bytes_per_pixel
+            };
             let Some(image) = frame_to_rgb(chunk_data, width, height, stride, info.format())
             else {
                 return;
