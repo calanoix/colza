@@ -97,13 +97,10 @@ pub struct MagnifierState {
 ///   fullscreen one and shows black instead, as tiling compositors do.
 ///   Hyprland and COSMIC's tiling are expected to behave alike.
 ///
-/// With a black backdrop, a live screen share also films that black and
-/// feeds it back into the loupe. So everywhere but KDE, the overlay
-/// paints the captured image itself, which looks the same. It can't stay
-/// live: the share would film colza's own painting rather than the screen
-/// under it, so the first frame (captured before the overlay appeared,
-/// without the cursor) is kept and the share closed. Unknown desktops get
-/// this too: a frozen image beats a black screen with wrong colors.
+/// So everywhere but KDE, the overlay paints the captured image itself,
+/// which looks the same, and colza captures with a screenshot only (see
+/// [`live_capture_supported`]). Unknown desktops get this too: a frozen
+/// image beats a black screen with wrong colors.
 ///
 /// Decided by `XDG_CURRENT_DESKTOP` containing "KDE".
 /// `COLZA_OPAQUE_MAGNIFIER=1` or `=0` forces it either way, to test a
@@ -116,6 +113,20 @@ pub fn needs_opaque_backdrop() -> bool {
         desktops.split(':').any(|d| d.eq_ignore_ascii_case("KDE"))
     });
     !is_kde
+}
+
+/// Whether screen sharing is offered at all: only where the magnifier can
+/// stay a transparent pane over the live screen (KDE so far, see
+/// [`needs_opaque_backdrop`]).
+///
+/// Elsewhere it would bring nothing over a screenshot. With the overlay
+/// opaque, a share films colza's own painting instead of the screen, so
+/// only its first frame is usable: a still image, after an extra
+/// permission dialog. And it didn't even keep the cursor out reliably:
+/// in VM tests, Sway's and COSMIC's first frame had it baked in anyway.
+/// Those desktops get the Screenshot portal only.
+pub fn live_capture_supported() -> bool {
+    !needs_opaque_backdrop()
 }
 
 impl MagnifierState {

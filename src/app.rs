@@ -171,7 +171,7 @@ fn back_button_id() -> egui::Id {
 /// Version shown on the settings page. The suffix marks test builds, so
 /// the one running in a VM can be told apart from the last; bump it with
 /// each one, and drop it (back to the plain Cargo version) for a release.
-const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"), "-test.7");
+const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"), "-test.8");
 
 /// Repaint interval while the magnifier is open (about 60 fps). Needed
 /// because vsync is off (see `main`), so nothing else paces the redraws.
@@ -1837,8 +1837,16 @@ impl App {
 
         match crate::runtime::shared() {
             Ok(rt) => {
+                let live = crate::magnifier::live_capture_supported();
                 rt.spawn(async move {
-                    let _ = tx.send(crate::screencast::open_best().await);
+                    let result = if live {
+                        crate::screencast::open_best().await
+                    } else {
+                        crate::portal::capture_screen()
+                            .await
+                            .map(|image| Some((ScreenSource::Still, image)))
+                    };
+                    let _ = tx.send(result);
                 });
             }
             Err(err) => {
@@ -2110,9 +2118,12 @@ impl App {
     }
 
     /// Whether both capture methods are denied, so no pick can succeed.
+    /// Whether every capture method offered here is denied, so no pick can
+    /// succeed. Only the screenshot where screen sharing isn't offered.
     fn picking_blocked(&self) -> bool {
-        self.screencast_state() == PermissionState::Denied
-            && self.screenshot_state() == PermissionState::Denied
+        self.screenshot_state() == PermissionState::Denied
+            && (!crate::magnifier::live_capture_supported()
+                || self.screencast_state() == PermissionState::Denied)
     }
 
     /// The Permissions card: one row per capture method, in the order a
@@ -2123,32 +2134,40 @@ impl App {
         // No reset under a pick in flight, which may be asking right now.
         let idle = matches!(self.mode, Mode::Normal);
 
+        // Screen sharing only where it can be live (KDE so far, see
+        // `magnifier::live_capture_supported`); a screenshot elsewhere.
+        let live = crate::magnifier::live_capture_supported();
+
         card(ui, p, |ui| {
             card_title(ui, p, "Permissions", |_| {});
             ui.label(
-                egui::RichText::new(
+                egui::RichText::new(if live {
                     "colza looks at your screen only while you pick a color. It uses the \
-                     first method below that isn't denied.",
-                )
+                     first method below that isn't denied."
+                } else {
+                    "colza looks at your screen only while you pick a color."
+                })
                 .size(12.0)
                 .color(p.text_secondary),
             );
             ui.add_space(4.0);
 
-            if permission_row(
-                ui,
-                p,
-                "Screen sharing",
-                "Pick a color from a live feed of your screen.",
-                self.screencast_state(),
-                idle,
-            ) {
-                crate::screencast::forget_declined();
-                crate::token_store::clear();
-                self.has_restore_token = crate::token_store::exists();
-            }
+            if live {
+                if permission_row(
+                    ui,
+                    p,
+                    "Screen sharing",
+                    "Pick a color from a live feed of your screen.",
+                    self.screencast_state(),
+                    idle,
+                ) {
+                    crate::screencast::forget_declined();
+                    crate::token_store::clear();
+                    self.has_restore_token = crate::token_store::exists();
+                }
 
-            ui.add(egui::Separator::default().spacing(8.0));
+                ui.add(egui::Separator::default().spacing(8.0));
+            }
 
             let screenshot_idle = idle && self.permissions.screenshot_task.is_none();
             if permission_row(
@@ -2587,11 +2606,6 @@ impl eframe::App for App {
                     let mut state = MagnifierState::new(first_frame);
                     state.cursor_in_image = !source.is_live();
                     state.opaque_backdrop = crate::magnifier::needs_opaque_backdrop();
-                    // With an opaque backdrop, later frames would only film
-                    // colza's own overlay (see `needs_opaque_backdrop`):
-                    // the first one is kept, and dropping the live source
-                    // here stops the stream and closes the share.
-                    let source = if state.opaque_backdrop { ScreenSource::Still } else { source };
                     state.live = source.is_live();
                     self.mode = Mode::Magnifying(*target, Box::new(state), source);
                     ctx.request_repaint();
