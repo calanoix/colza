@@ -171,7 +171,7 @@ fn back_button_id() -> egui::Id {
 /// Version shown on the settings page. The suffix marks test builds, so
 /// the one running in a VM can be told apart from the last; bump it with
 /// each one, and drop it (back to the plain Cargo version) for a release.
-const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"), "-test.8");
+const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"), "-test.9");
 
 /// Repaint interval while the magnifier is open (about 60 fps). Needed
 /// because vsync is off (see `main`), so nothing else paces the redraws.
@@ -2865,6 +2865,8 @@ const WINDOW_ICON: &[u8] = include_bytes!("../assets/icon-colza-256.png");
 pub(crate) const APP_ID: &str = "colza";
 
 pub fn main() -> anyhow::Result<()> {
+    // First of all portal calls: see `permissions::register_host_app`.
+    crate::permissions::register_host_app();
     // Read before the window exists, so it opens at its final size. eframe
     // creates the window before the app (with a zoom of 1), hence the size
     // scaled by hand here and the zoom set in the creator below.

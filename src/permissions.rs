@@ -29,7 +29,7 @@
 //! own requests returned ([`last_outcome`]) and show the user the
 //! `flatpak permission-remove` command that resets the entry.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use ashpd::zbus;
 
@@ -108,23 +108,73 @@ pub fn reset_command() -> Option<String> {
     Some(format!("flatpak permission-remove {TABLE} {ID} {app_id}"))
 }
 
+/// Whether [`register_host_app`] succeeded, so the portal knows a host
+/// install of colza by `APP_ID`.
+static REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Tells the portal that this host (unsandboxed) process is colza, so it
+/// stores colza's permissions under `APP_ID`, as it does for the Flatpak.
+/// Does nothing when sandboxed, where the portal knows the app already.
+///
+/// Without it, the portal guesses a host app's id from the systemd scope
+/// the process runs in. From the menu, that scope is named after colza's
+/// `.desktop` file, which is right. From a terminal, colza runs in the
+/// *terminal's* scope and gets its id: launched from Alacritty, colza's
+/// screenshots were asked for, and refused, as Alacritty's
+/// (`net.local.alacritty` in the store), which colza neither saw nor could
+/// reset.
+///
+/// Must run before any other portal call: the portal refuses to rename a
+/// connection it has already identified, and ashpd shares one connection
+/// for every call. Needs xdg-desktop-portal 1.19 or later; with an older
+/// one, colza falls back to guessing like the portal does (see
+/// [`host_keys`]). Blocks for at most half a second.
+pub fn register_host_app() {
+    if is_sandboxed() {
+        return;
+    }
+    let Ok(rt) = crate::runtime::shared() else {
+        return;
+    };
+    let result = rt.block_on(async {
+        let app_id = ashpd::AppID::try_from(crate::app::APP_ID)?;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            ashpd::register_host_app(app_id),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("the portal didn't answer in time"))??;
+        anyhow::Ok(())
+    });
+    match result {
+        Ok(()) => REGISTERED.store(true, Ordering::Relaxed),
+        Err(err) => eprintln!(
+            "colza: could not register with the portal as {} ({err}); permissions \
+             may be stored under another app's id",
+            crate::app::APP_ID
+        ),
+    }
+}
+
 /// The app ids the portal may have stored colza's answer under, for a
 /// host (unsandboxed) install.
 ///
-/// The portal can't know a host app's id for sure. It takes it from the
-/// systemd scope the process runs in, which is named after the desktop
-/// file when colza is launched from a menu (hence `APP_ID`, which names
-/// colza's `.desktop` file), and otherwise falls back to "" (launched
-/// from a terminal). Which one applied depends on how this run started,
-/// so both are read and both are reset.
+/// Registered ([`register_host_app`]), that's `APP_ID` and nothing else.
+/// Otherwise the portal guesses from the systemd scope: `APP_ID` when
+/// colza is launched from its menu entry, the terminal's id when launched
+/// from one (which colza can't know), or "" when there's no app scope at
+/// all. The first and last are read and reset.
 ///
 /// "" is shared by every unsandboxed app the portal can't identify, so
 /// resetting it makes those ask again too. That is the portal's own
-/// granularity (its dialog for "" even says "Allow apps to take
-/// screenshots?"), and a reset only ever leads to a question, never to a
+/// granularity, and a reset only ever leads to a question, never to a
 /// silent grant.
-fn host_keys() -> [&'static str; 2] {
-    [crate::app::APP_ID, ""]
+fn host_keys() -> &'static [&'static str] {
+    if REGISTERED.load(Ordering::Relaxed) {
+        &[crate::app::APP_ID]
+    } else {
+        &[crate::app::APP_ID, ""]
+    }
 }
 
 /// Reads the stored answer; [`Lookup::Observed`] when the store can't be
@@ -149,7 +199,7 @@ async fn read_store() -> zbus::Result<Answer> {
     }
     let connection = zbus::Connection::session().await?;
     let mut answers = Vec::new();
-    for app in host_keys() {
+    for &app in host_keys() {
         let reply = connection
             .call_method(
                 Some(STORE_NAME),
@@ -191,7 +241,7 @@ pub async fn reset() -> anyhow::Result<()> {
         anyhow::bail!("the permission store isn't reachable from the sandbox");
     }
     let connection = zbus::Connection::session().await?;
-    for app in host_keys() {
+    for &app in host_keys() {
         let reply = connection
             .call_method(
                 Some(STORE_NAME),
