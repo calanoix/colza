@@ -51,9 +51,9 @@ modules:
     build-commands:
       - cargo --offline build --release --locked
       - install -Dm755 target/release/colza /app/bin/colza
-      - install -Dm644 flatpak/io.github.calanoix.colza.desktop
+      - install -Dm644 data/io.github.calanoix.colza.desktop
           /app/share/applications/io.github.calanoix.colza.desktop
-      - install -Dm644 flatpak/io.github.calanoix.colza.metainfo.xml
+      - install -Dm644 data/io.github.calanoix.colza.metainfo.xml
           /app/share/metainfo/io.github.calanoix.colza.metainfo.xml
       - install -Dm644 flatpak/io.github.calanoix.colza.svg
           /app/share/icons/hicolor/scalable/apps/io.github.calanoix.colza.svg
