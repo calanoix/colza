@@ -168,10 +168,10 @@ fn back_button_id() -> egui::Id {
     egui::Id::new("colza-back-button")
 }
 
-/// Version shown on the settings page. The suffix marks test builds, so
-/// the one running in a VM can be told apart from the last; bump it with
-/// each one, and drop it (back to the plain Cargo version) for a release.
-const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"), "-test.9");
+/// Version shown on the settings page. For a test build, append a suffix
+/// (`"-test.1"`, bumped with each one) so the build running in a VM can be
+/// told apart from the last; releases show the plain Cargo version.
+const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 /// Repaint interval while the magnifier is open (about 60 fps). Needed
 /// because vsync is off (see `main`), so nothing else paces the redraws.

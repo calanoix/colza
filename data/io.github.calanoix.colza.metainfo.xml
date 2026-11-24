@@ -4,11 +4,10 @@
 <component type="desktop-application">
   <id>io.github.calanoix.colza</id>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>GPL-3.0-or-later</project_license>
+  <project_license>Apache-2.0</project_license>
 
   <name>colza</name>
   <summary>Pick colors on screen and check WCAG contrast</summary>
-  <summary xml:lang="fr">Prélever des couleurs à l'écran et vérifier le contraste WCAG</summary>
 
   <description>
     <p>
@@ -41,6 +40,6 @@
   </supports>
 
   <releases>
-    <release version="0.1.0" date="2026-11-21"/>
+    <release version="1.0.0" date="2026-11-24"/>
   </releases>
 </component>

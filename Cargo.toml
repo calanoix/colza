@@ -1,9 +1,9 @@
 [package]
 name = "colza"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
-description = "Color picker and WCAG contrast checker for Wayland (GNOME/KDE) via xdg-desktop-portal"
-license = "MIT"
+description = "A linux color picker and accessibility contrast checker"
+license = "Apache-2.0"
 repository = "https://github.com/calanoix/colza"
 
 [dependencies]
